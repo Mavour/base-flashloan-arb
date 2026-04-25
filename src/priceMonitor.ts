@@ -27,7 +27,7 @@ export interface ArbOpportunity {
 // ════════════════════════════════════════════════
 
 // Aave V3 flashloan premium = 0.09%
-const AAVE_PREMIUM_BPS = 9n;
+const AAVE_PREMIUM_BPS = 5n;
 const BPS_DENOMINATOR  = 10000n;
 
 // QuoterV2 Base mainnet (Uniswap official)
