@@ -30,6 +30,11 @@ async function simulateTx(
   config: BotConfig,
   opportunity: ArbOpportunity
 ): Promise<{ success: boolean; error?: string }> {
+  // Kalau contract belum deploy, skip simulation
+  if (!config.contractAddress) {
+    return { success: false, error: 'Contract not deployed yet' };
+  }
+
   try {
     const contract = new ethers.Contract(
       config.contractAddress,
@@ -37,7 +42,6 @@ async function simulateTx(
       config.wallet
     );
 
-    // eth_call = simulate tanpa send
     await contract.executeArbitrage.staticCall(
       opportunity.flashloanAmount,
       opportunity.expectedProfit,
@@ -45,7 +49,6 @@ async function simulateTx(
 
     return { success: true };
   } catch (err: any) {
-    // Parse error message dari revert
     const msg = err?.reason ?? err?.message ?? String(err);
     return { success: false, error: msg };
   }
