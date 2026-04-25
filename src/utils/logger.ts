@@ -45,9 +45,9 @@ export const logger = {
     ),
 
   scan: (pairs: number, opps: number) =>
-    console.log(
-      `${c('dim', ts())} ${c('blue', 'SCAN')} ` +
-      `pairs=${c('white', String(pairs))} ` +
-      `opportunities=${c(opps > 0 ? 'yellow' : 'white', String(opps))}`
+  console.log(
+    `${c('dim', ts())} ${c('blue', 'SCAN')} ` +
+    `pairs=${c('white', String(pairs))} ` +
+    `opportunities=${c(opps > 0 ? 'yellow' : 'white', String(opps))}`
     ),
 };
