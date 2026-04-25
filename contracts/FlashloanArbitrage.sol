@@ -172,7 +172,6 @@ contract FlashloanArbitrage is IFlashLoanSimpleReceiver {
         address initiator,
         bytes calldata params
     ) external override returns (bool) {
-        // Security: hanya Aave Pool yang boleh panggil ini
         require(msg.sender == AAVE_POOL, "Caller not Aave Pool");
         require(initiator == address(this), "Initiator not this contract");
 
@@ -181,7 +180,6 @@ contract FlashloanArbitrage is IFlashLoanSimpleReceiver {
         uint256 minProfit       = abi.decode(params, (uint256));
 
         // ─── Step 1: Swap WETH → aWETH via Uniswap V3 ───
-        // aWETH dijual lebih murah di market → dapat lebih banyak
         IERC20(WETH).approve(UNISWAP_ROUTER, flashloanAmount);
 
         uint256 aWethReceived = ISwapRouter(UNISWAP_ROUTER).exactInputSingle(
@@ -191,13 +189,15 @@ contract FlashloanArbitrage is IFlashLoanSimpleReceiver {
                 fee:               POOL_FEE,
                 recipient:         address(this),
                 amountIn:          flashloanAmount,
-                amountOutMinimum:  (flashloanAmount * 9950) / 10000,
+                amountOutMinimum:  0, // kita check profit sendiri di bawah
                 sqrtPriceLimitX96: 0
             })
         );
 
+        // Pastikan dapat aWETH lebih dari yang dipinjam
+        require(aWethReceived > flashloanAmount, "Swap not profitable");
+
         // ─── Step 2: Redeem aWETH → WETH dari Aave pool ───
-        // aWETH bisa di-redeem 1:1 dengan WETH di Aave
         IERC20(AWETH).approve(AAVE_POOL, aWethReceived);
         uint256 wethReceived = IPool(AAVE_POOL).withdraw(
             WETH,
@@ -205,19 +205,17 @@ contract FlashloanArbitrage is IFlashLoanSimpleReceiver {
             address(this)
         );
 
-        // ─── Step 3: Hitung profit dan validasi ───
-        uint256 totalDebt   = flashloanAmount + premium;
-        require(wethReceived > totalDebt, "Not profitable");
+        // ─── Step 3: Validasi profit ───
+        uint256 totalDebt = flashloanAmount + premium;
+        require(wethReceived > totalDebt, "Not profitable after premium");
 
         uint256 profit = wethReceived - totalDebt;
         require(profit >= minProfit, "Profit below minimum");
 
-        // ─── Step 4: Kembalikan flashloan ───
+        // ─── Step 4: Approve Aave untuk ambil kembali flashloan ───
         IERC20(WETH).approve(AAVE_POOL, totalDebt);
-        // Aave akan pull dana dari contract ini setelah executeOperation return
 
         emit ArbitrageExecuted(flashloanAmount, profit, block.timestamp);
-
         return true;
     }
 
