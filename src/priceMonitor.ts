@@ -239,6 +239,6 @@ export async function scanOpportunities(
     return 0;
   });
 
-  logger.scan(ARB_PAIRS.length, opportunities.length);
+  logger.scan(ARB_PAIRS?.length ?? 0, opportunities.length);
   return opportunities;
 }
