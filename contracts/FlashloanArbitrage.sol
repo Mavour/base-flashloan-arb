@@ -191,7 +191,7 @@ contract FlashloanArbitrage is IFlashLoanSimpleReceiver {
                 fee:               POOL_FEE,
                 recipient:         address(this),
                 amountIn:          flashloanAmount,
-                amountOutMinimum:  flashloanAmount, // harus dapat minimal sama banyak
+                amountOutMinimum:  (flashloanAmount * 9950) / 10000,
                 sqrtPriceLimitX96: 0
             })
         );

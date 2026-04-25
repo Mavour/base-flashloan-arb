@@ -65,7 +65,8 @@ async function getUniswapPrice(
     // Convert sqrtPriceX96 ke price ratio
     // price = (sqrtPriceX96 / 2^96)^2
     const Q96    = 2n ** 96n;
-    const priceRatio = Number(sqrtPriceX96 * sqrtPriceX96) / Number(Q96 * Q96);
+    const sqrtPrice  = Number(sqrtPriceX96) / Number(Q96);
+    const priceRatio = sqrtPrice * sqrtPrice;
 
     // Sesuaikan decimals
     const [dec0, dec1] = await Promise.all([
