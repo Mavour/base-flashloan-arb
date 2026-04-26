@@ -19,38 +19,35 @@ export interface ExecutionResult {
 }
 
 // ════════════════════════════════════════════════
-// SIMULATE TX (eth_call)
+// SIMULATE TX
 // ════════════════════════════════════════════════
 
-/**
- * Simulate transaksi sebelum kirim.
- * Kalau gagal di sini → tidak buang gas.
- */
 async function simulateTx(
   config: BotConfig,
-  opportunity: ArbOpportunity
+  opp: ArbOpportunity
 ): Promise<{ success: boolean; error?: string }> {
-  // Kalau contract belum deploy, skip simulation
   if (!config.contractAddress) {
-    return { success: false, error: 'Contract not deployed yet' };
+    return { success: false, error: 'Contract not deployed' };
   }
 
   try {
     const contract = new ethers.Contract(
-      config.contractAddress,
-      CONTRACT_ABI,
-      config.wallet
+      config.contractAddress, CONTRACT_ABI, config.wallet
     );
 
     await contract.executeArbitrage.staticCall(
-      opportunity.flashloanAmount,
-      opportunity.expectedProfit,
+      opp.pair.tokenIn,
+      opp.flashloanAmount,
+      opp.pair.tokenOut,
+      opp.pair.uniswapFee,
+      opp.pair.aerodromeStable,
+      opp.strategy,
+      opp.expectedProfit,
     );
 
     return { success: true };
   } catch (err: any) {
-    const msg = err?.reason ?? err?.message ?? String(err);
-    return { success: false, error: msg };
+    return { success: false, error: err?.reason ?? err?.message ?? String(err) };
   }
 }
 
@@ -60,96 +57,90 @@ async function simulateTx(
 
 async function estimateGas(
   config: BotConfig,
-  opportunity: ArbOpportunity
+  opp: ArbOpportunity
 ): Promise<bigint> {
   try {
     const contract = new ethers.Contract(
-      config.contractAddress,
-      CONTRACT_ABI,
-      config.wallet
+      config.contractAddress, CONTRACT_ABI, config.wallet
     );
-
     const gas = await contract.executeArbitrage.estimateGas(
-      opportunity.flashloanAmount,
-      opportunity.expectedProfit,
+      opp.pair.tokenIn,
+      opp.flashloanAmount,
+      opp.pair.tokenOut,
+      opp.pair.uniswapFee,
+      opp.pair.aerodromeStable,
+      opp.strategy,
+      opp.expectedProfit,
     );
-
-    // Tambah 20% buffer untuk safety
-    return (gas * 120n) / 100n;
+    return (gas * 130n) / 100n; // +30% buffer
   } catch {
-    return 500_000n; // fallback estimate
+    return 600_000n;
   }
 }
 
 // ════════════════════════════════════════════════
-// EXECUTE ARBITRAGE
+// EXECUTE
 // ════════════════════════════════════════════════
 
 export async function executeArbitrage(
   config: BotConfig,
-  opportunity: ArbOpportunity
+  opp: ArbOpportunity
 ): Promise<ExecutionResult> {
-  logger.info(`Executing: ${opportunity.pair.name}`);
-  logger.info(`Flashloan: ${ethers.formatEther(opportunity.flashloanAmount)} ETH`);
-  logger.info(`Min profit: ${opportunity.expectedProfitEth} ETH`);
+  logger.info(`Executing: ${opp.pair.name} [${opp.strategyName}]`);
+  logger.info(`Flashloan: ${ethers.formatEther(opp.flashloanAmount)} ${opp.pair.tokenIn === '0x4200000000000000000000000000000000000006' ? 'WETH' : 'USDC'}`);
+  logger.info(`Min profit: ${opp.expectedProfitEth} ETH`);
 
-  // ─── 1. Simulate dulu ───
-  logger.info('Simulating transaction...');
-  const sim = await simulateTx(config, opportunity);
+  // ─── 1. Simulate ───
+  logger.info('Simulating...');
+  const sim = await simulateTx(config, opp);
 
   if (!sim.success) {
-    logger.warn(`Simulation failed: ${sim.error}`);
-    return {
-      success: false,
-      error: `Simulation failed: ${sim.error}`,
-      isDryRun: config.isDryRun,
-    };
+    logger.warn(`Sim failed: ${sim.error}`);
+    return { success: false, error: `Sim failed: ${sim.error}`, isDryRun: config.isDryRun };
   }
   logger.success('Simulation passed!');
 
-  // ─── 2. DRY RUN stop di sini ───
+  // ─── 2. DRY RUN ───
   if (config.isDryRun) {
-    logger.trade('DRY_RUN_TX', opportunity.expectedProfitEth, true);
+    logger.trade('DRY_RUN_TX', opp.expectedProfitEth, true);
     return {
       success: true,
       txHash: 'DRY_RUN',
-      actualProfitEth: opportunity.expectedProfitEth,
+      actualProfitEth: opp.expectedProfitEth,
       isDryRun: true,
     };
   }
 
-  // ─── 3. Estimate gas ───
-  const gasLimit    = await estimateGas(config, opportunity);
-  const feeData     = await config.provider.getFeeData();
-  const gasPrice    = feeData.gasPrice ?? ethers.parseUnits('0.1', 'gwei');
-  const gasCostWei  = gasLimit * gasPrice;
-  const gasCostEth  = ethers.formatEther(gasCostWei);
+  // ─── 3. Estimate gas & check profitability ───
+  const gasLimit   = await estimateGas(config, opp);
+  const feeData    = await config.provider.getFeeData();
+  const gasPrice   = feeData.gasPrice ?? ethers.parseUnits('0.1', 'gwei');
+  const gasCostWei = gasLimit * gasPrice;
 
-  logger.info(`Gas estimate: ${gasLimit} units (~${gasCostEth} ETH)`);
-
-  // ─── 4. Cek profit masih worth it setelah gas ───
-  const netAfterGas = opportunity.expectedProfit - gasCostWei;
-  if (netAfterGas <= 0n) {
+  if (opp.expectedProfit <= gasCostWei) {
     return {
       success: false,
-      error: `Gas cost (${gasCostEth} ETH) exceeds profit (${opportunity.expectedProfitEth} ETH)`,
+      error: `Gas cost (${ethers.formatEther(gasCostWei)} ETH) exceeds profit`,
       isDryRun: false,
     };
   }
 
-  // ─── 5. LIVE: Kirim transaksi ───
+  // ─── 4. LIVE TX ───
   logger.warn('⚡ Sending LIVE transaction...');
 
   try {
     const contract = new ethers.Contract(
-      config.contractAddress,
-      CONTRACT_ABI,
-      config.wallet
+      config.contractAddress, CONTRACT_ABI, config.wallet
     );
 
     const tx = await contract.executeArbitrage(
-      opportunity.flashloanAmount,
-      opportunity.expectedProfit,
+      opp.pair.tokenIn,
+      opp.flashloanAmount,
+      opp.pair.tokenOut,
+      opp.pair.uniswapFee,
+      opp.pair.aerodromeStable,
+      opp.strategy,
+      opp.expectedProfit,
       {
         gasLimit,
         maxPriorityFeePerGas: config.maxPriorityFeeGwei,
@@ -158,70 +149,52 @@ export async function executeArbitrage(
     );
 
     logger.info(`TX sent: ${tx.hash}`);
-    logger.info('Waiting for confirmation...');
-
-    const receipt = await tx.wait(1); // tunggu 1 konfirmasi
+    const receipt = await tx.wait(1);
 
     if (!receipt || receipt.status === 0) {
-      return {
-        success: false,
-        error: 'Transaction reverted on-chain',
-        txHash: tx.hash,
-        isDryRun: false,
-      };
+      return { success: false, error: 'TX reverted', txHash: tx.hash, isDryRun: false };
     }
 
-    const actualGasCost = ethers.formatEther(
-      receipt.gasUsed * receipt.gasPrice
-    );
-
-    logger.trade(tx.hash, opportunity.expectedProfitEth, false);
+    const gasCostEth = ethers.formatEther(receipt.gasUsed * receipt.gasPrice);
+    logger.trade(tx.hash, opp.expectedProfitEth, false);
 
     return {
       success: true,
       txHash:          tx.hash,
-      actualProfitEth: opportunity.expectedProfitEth,
+      actualProfitEth: opp.expectedProfitEth,
       gasUsed:         receipt.gasUsed.toString(),
-      gasCostEth:      actualGasCost,
+      gasCostEth,
       isDryRun:        false,
     };
-
   } catch (err: any) {
     logger.error('TX failed', err);
-    return {
-      success: false,
-      error: err?.reason ?? String(err),
-      isDryRun: false,
-    };
+    return { success: false, error: err?.reason ?? String(err), isDryRun: false };
   }
 }
 
 // ════════════════════════════════════════════════
-// WITHDRAW PROFIT FROM CONTRACT
+// WITHDRAW PROFIT
 // ════════════════════════════════════════════════
 
-/**
- * Withdraw accumulated profit dari contract ke wallet owner.
- * Dipanggil manual atau otomatis setelah N trades.
- */
-export async function withdrawProfit(config: BotConfig): Promise<void> {
+export async function withdrawProfit(
+  config: BotConfig,
+  token: string
+): Promise<void> {
   if (config.isDryRun || !config.contractAddress) return;
 
   try {
     const contract = new ethers.Contract(
-      config.contractAddress,
-      CONTRACT_ABI,
-      config.wallet
+      config.contractAddress, CONTRACT_ABI, config.wallet
     );
 
-    const pending = await contract.getPendingProfit();
+    const pending = await contract.getPendingProfit(token);
     if (pending === 0n) {
-      logger.info('No profit to withdraw');
+      logger.info(`No profit to withdraw for ${token}`);
       return;
     }
 
-    logger.info(`Withdrawing ${ethers.formatEther(pending)} ETH from contract...`);
-    const tx = await contract.withdrawProfit();
+    logger.info(`Withdrawing ${ethers.formatEther(pending)} from contract...`);
+    const tx = await contract.withdrawToken(token);
     await tx.wait(1);
     logger.success(`Withdrawn! TX: ${tx.hash}`);
   } catch (err) {

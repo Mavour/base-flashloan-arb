@@ -5,6 +5,7 @@ import { executeArbitrage, withdrawProfit } from './executor';
 import { recordTrade, printSummary, getDailyStats } from './tracker';
 import { initTelegram, notify } from './notifications';
 import { startHealthCheck, stopHealthCheck, tickRound, setMeta } from './healthcheck';
+import { BASE }                 from './addresses';
 import { logger }               from './utils/logger';
 
 // ════════════════════════════════════════════════
@@ -12,35 +13,35 @@ import { logger }               from './utils/logger';
 // ════════════════════════════════════════════════
 
 const session = {
-  startTime:     Date.now(),
-  totalRounds:   0,
-  totalExecuted: 0,
+  startTime:      Date.now(),
+  totalRounds:    0,
+  totalExecuted:  0,
   totalProfitEth: 0,
-  totalFailed:   0,
+  totalFailed:    0,
 };
 
-// Auto-withdraw setiap N trades
-const WITHDRAW_EVERY_N_TRADES = 10;
+const WITHDRAW_EVERY_N = 5;
 
 // ════════════════════════════════════════════════
 // SINGLE ROUND
 // ════════════════════════════════════════════════
 
-async function runOneRound(config: ReturnType<typeof loadConfig>): Promise<void> {
+async function runOneRound(config: ReturnType<typeof loadConfig>) {
   session.totalRounds++;
   tickRound();
 
   try {
-    // ─── 1. Scan peluang ───
-    const opportunities = await scanOpportunities(config);
-    if (opportunities.length === 0) return;
+    // ─── 1. Scan ───
+    const opps = await scanOpportunities(config);
+    if (opps.length === 0) return;
 
-    // ─── 2. Ambil yang paling profitable ───
-    const best = opportunities[0];
+    // ─── 2. Best opportunity ───
+    const best = opps[0];
+    logger.info(`Best: ${best.pair.name} [${best.strategyName}] profit=${best.expectedProfitEth} ETH`);
 
-    // ─── 3. Notify opportunity ───
+    // ─── 3. Notify ───
     await notify.opportunity(
-      best.pair.name,
+      `${best.pair.name} [${best.strategyName}]`,
       best.expectedProfitEth,
       best.profitBps
     );
@@ -50,17 +51,17 @@ async function runOneRound(config: ReturnType<typeof loadConfig>): Promise<void>
 
     if (!result.success) {
       session.totalFailed++;
-      logger.warn(`Execution failed: ${result.error}`);
+      logger.warn(`Failed: ${result.error}`);
       return;
     }
 
     session.totalExecuted++;
     session.totalProfitEth += parseFloat(result.actualProfitEth ?? '0');
 
-    // ─── 5. Record trade ───
+    // ─── 5. Record ───
     recordTrade({
       timestamp:          new Date().toISOString(),
-      pair:               best.pair.name,
+      pair:               `${best.pair.name} [${best.strategyName}]`,
       flashloanAmountEth: ethers.formatEther(best.flashloanAmount),
       profitEth:          result.actualProfitEth ?? '0',
       gasEth:             result.gasCostEth ?? '0',
@@ -70,18 +71,20 @@ async function runOneRound(config: ReturnType<typeof loadConfig>): Promise<void>
       isDryRun:           config.isDryRun,
     });
 
-    // ─── 6. Telegram notif ───
+    // ─── 6. Telegram ───
     await notify.trade(
-      best.pair.name,
+      `${best.pair.name} [${best.strategyName}]`,
       result.actualProfitEth ?? '0',
       result.txHash ?? '',
       config.isDryRun
     );
 
     // ─── 7. Auto-withdraw setiap N trades ───
-    if (!config.isDryRun && session.totalExecuted % WITHDRAW_EVERY_N_TRADES === 0) {
-      logger.info(`Auto-withdrawing profit after ${WITHDRAW_EVERY_N_TRADES} trades...`);
-      await withdrawProfit(config);
+    if (!config.isDryRun && session.totalExecuted % WITHDRAW_EVERY_N === 0) {
+      logger.info('Auto-withdrawing profits...');
+      // Withdraw semua token yang mungkin ada profit
+      await withdrawProfit(config, BASE.WETH);
+      await withdrawProfit(config, BASE.USDC);
     }
 
   } catch (err) {
@@ -94,13 +97,13 @@ async function runOneRound(config: ReturnType<typeof loadConfig>): Promise<void>
 // SHUTDOWN
 // ════════════════════════════════════════════════
 
-async function shutdown(config: ReturnType<typeof loadConfig>): Promise<void> {
+async function shutdown(config: ReturnType<typeof loadConfig>) {
   logger.header('BOT STOPPING...');
   printSummary();
 
-  // Withdraw profit sebelum shutdown (kalau live)
   if (!config.isDryRun && config.contractAddress) {
-    await withdrawProfit(config);
+    await withdrawProfit(config, BASE.WETH);
+    await withdrawProfit(config, BASE.USDC);
   }
 
   const d = getDailyStats();
@@ -110,56 +113,28 @@ async function shutdown(config: ReturnType<typeof loadConfig>): Promise<void> {
 }
 
 // ════════════════════════════════════════════════
-// DAILY SCHEDULER
-// ════════════════════════════════════════════════
-
-function scheduleDailySummary(config: ReturnType<typeof loadConfig>): void {
-  const now      = new Date();
-  const midnight = new Date(now);
-  midnight.setUTCHours(24, 0, 0, 0);
-  const msUntil  = midnight.getTime() - now.getTime();
-
-  setTimeout(async () => {
-    printSummary();
-    const d = getDailyStats();
-    await notify.daily(d.totalTrades, d.netProfitEth);
-
-    setInterval(async () => {
-      printSummary();
-      const d2 = getDailyStats();
-      await notify.daily(d2.totalTrades, d2.netProfitEth);
-    }, 24 * 60 * 60 * 1000);
-  }, msUntil);
-
-  logger.info(`Daily summary in ${Math.floor(msUntil / 3600000)}h`);
-}
-
-// ════════════════════════════════════════════════
 // MAIN
 // ════════════════════════════════════════════════
 
-async function main(): Promise<void> {
-  logger.header('BASE FLASHLOAN ARB BOT v1.0');
+async function main() {
+  logger.header('BASE CROSS-DEX FLASHLOAN ARB BOT v2.0');
 
   const config = loadConfig();
 
-  // ─── Print config ───
   logger.info(`Wallet:    ${config.walletAddress}`);
-  logger.info(`Contract:  ${config.contractAddress || 'NOT DEPLOYED YET'}`);
+  logger.info(`Contract:  ${config.contractAddress || 'NOT DEPLOYED'}`);
   logger.info(`Mode:      ${config.isDryRun ? '🟡 DRY RUN' : '🔴 LIVE'}`);
   logger.info(`Interval:  ${config.scanIntervalMs / 1000}s`);
   logger.info(`Min profit: ${ethers.formatEther(config.minProfitEth)} ETH`);
   logger.info(`Loan size:  ${ethers.formatEther(config.flashloanAmountEth)} ETH`);
 
-  // ─── Cek ETH balance ───
+  // Balance check
   const balance = await config.provider.getBalance(config.walletAddress);
   logger.info(`ETH balance: ${ethers.formatEther(balance)} ETH`);
-
   if (balance < ethers.parseEther('0.005') && !config.isDryRun) {
-    logger.warn('Low ETH balance! Need at least 0.005 ETH for gas');
+    logger.warn('Low ETH! Need at least 0.005 ETH for gas');
   }
 
-  // ─── Init services ───
   initTelegram();
   startHealthCheck();
   setMeta(
@@ -168,15 +143,11 @@ async function main(): Promise<void> {
     config.contractAddress ? config.contractAddress.slice(0, 10) + '...' : 'not deployed'
   );
 
-  // ─── Warning untuk contract yang belum deploy ───
   if (!config.contractAddress) {
-    logger.warn('Contract not deployed yet!');
-    logger.warn('Run: npm run compile && npm run deploy');
-    logger.warn('Then add ARBITRAGE_CONTRACT_ADDRESS to .env');
-    logger.warn('Continuing in MONITOR-ONLY mode (will not execute)...');
+    logger.warn('Contract not deployed! Run: npm run compile && npm run deploy');
+    logger.warn('Running in MONITOR-ONLY mode...');
   }
 
-  // ─── Safety delay untuk LIVE ───
   if (!config.isDryRun) {
     logger.warn('⚠️  LIVE MODE — starting in 5s. Ctrl+C to abort!');
     await new Promise(r => setTimeout(r, 5000));
@@ -184,29 +155,26 @@ async function main(): Promise<void> {
     logger.warn('DRY RUN — no real transactions');
   }
 
-  // ─── Notify start ───
-  await notify.started(
-    config.walletAddress,
-    config.contractAddress,
-    config.isDryRun
-  );
+  await notify.started(config.walletAddress, config.contractAddress, config.isDryRun);
 
-  // ─── Signal handlers ───
   process.on('SIGINT',  () => shutdown(config));
   process.on('SIGTERM', () => shutdown(config));
   process.on('uncaughtException', async (err) => {
-    logger.error('Uncaught exception', err);
+    logger.error('Uncaught', err);
     await notify.error(String(err));
     await shutdown(config);
   });
 
-  // ─── Daily scheduler ───
-  scheduleDailySummary(config);
+  // Daily summary scheduler
+  const now = new Date();
+  const midnight = new Date(now);
+  midnight.setUTCHours(24, 0, 0, 0);
+  setTimeout(async () => {
+    printSummary();
+    setInterval(printSummary, 24 * 60 * 60 * 1000);
+  }, midnight.getTime() - now.getTime());
 
-  // ════════════════════
-  //  MAIN LOOP
-  // ════════════════════
-  logger.success('Bot running! Scanning Base network...\n');
+  logger.success('Bot v2.0 running! Scanning Uniswap vs Aerodrome...\n');
 
   while (true) {
     await runOneRound(config);
@@ -215,7 +183,7 @@ async function main(): Promise<void> {
 }
 
 main().catch(async err => {
-  logger.error('Fatal startup error', err);
+  logger.error('Fatal error', err);
   await notify.error(String(err));
   process.exit(1);
 });

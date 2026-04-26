@@ -2,152 +2,150 @@ import { ethers }  from 'ethers';
 import * as dotenv from 'dotenv';
 dotenv.config();
 
+import {
+  BASE, ARB_PAIRS,
+  QUOTER_V2_ABI, AERODROME_ROUTER_ABI, ERC20_ABI
+} from '../src/addresses';
+
 // ════════════════════════════════════════════════
-// SCRIPT: CHECK OPPORTUNITY
-//
-// Cara run:
-//   npx tsx scripts/checkOpportunity.ts
-//
-// Fungsi:
-// - Scan semua pairs sekarang
-// - Tampilkan harga Uniswap vs Aave
-// - Hitung estimasi profit kalau ada
-// - Berguna untuk debug sebelum jalankan full bot
+// CHECK OPPORTUNITY v2.1 — Cross-DEX Scanner
+// Cara run: npm run check
 // ════════════════════════════════════════════════
 
-import { BASE, ARB_PAIRS } from '../src/addresses';
-
-const UNISWAP_FACTORY_ABI = [
-  'function getPool(address, address, uint24) view returns (address)',
-];
-const UNISWAP_POOL_ABI = [
-  'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16, uint16, uint16, uint8, bool)',
-  'function liquidity() view returns (uint128)',
-];
-const ERC20_ABI = [
-  'function decimals() view returns (uint8)',
-  'function symbol() view returns (string)',
-];
-
-// Aave flashloan premium = 0.09%
-const AAVE_PREMIUM = 0.0009;
-
-async function getPoolPrice(
+async function getUniQuote(
   provider: ethers.JsonRpcProvider,
-  tokenA: string,
-  tokenB: string,
-  fee: number
-): Promise<{ price: number; poolAddress: string; liquidity: string } | null> {
+  tokenIn: string, tokenOut: string,
+  fee: number, amountIn: bigint
+): Promise<bigint> {
   try {
-    const factory = new ethers.Contract(BASE.UNISWAP_FACTORY, UNISWAP_FACTORY_ABI, provider);
-    const poolAddress = await factory.getPool(tokenA, tokenB, fee);
+    const q = new ethers.Contract(BASE.QUOTER_V2, QUOTER_V2_ABI, provider);
+    const r = await q.quoteExactInputSingle.staticCall({
+      tokenIn, tokenOut, amountIn, fee, sqrtPriceLimitX96: 0
+    });
+    return BigInt(r[0].toString());
+  } catch { return 0n; }
+}
 
-    if (poolAddress === ethers.ZeroAddress) return null;
+async function getAeroQuote(
+  provider: ethers.JsonRpcProvider,
+  tokenIn: string, tokenOut: string,
+  stable: boolean, amountIn: bigint
+): Promise<bigint> {
+  try {
+    const r = new ethers.Contract(BASE.AERODROME_ROUTER, AERODROME_ROUTER_ABI, provider);
+    const routes = [{ from: tokenIn, to: tokenOut, stable, factory: BASE.AERODROME_FACTORY }];
+    const amounts = await r.getAmountsOut(amountIn, routes);
+    return BigInt(amounts[amounts.length - 1].toString());
+  } catch { return 0n; }
+}
 
-    const pool = new ethers.Contract(poolAddress, UNISWAP_POOL_ABI, provider);
-    const [slot0, liquidity] = await Promise.all([pool.slot0(), pool.liquidity()]);
-
-    const sqrtPriceX96 = BigInt(slot0.sqrtPriceX96.toString());
-    const Q96          = 2n ** 96n;
-    const priceRatio   = Number(sqrtPriceX96 * sqrtPriceX96) / Number(Q96 * Q96);
-
-    const tokenAContract = new ethers.Contract(tokenA, ERC20_ABI, provider);
-    const tokenBContract = new ethers.Contract(tokenB, ERC20_ABI, provider);
-    const [decA, decB]   = await Promise.all([
-      tokenAContract.decimals(),
-      tokenBContract.decimals(),
-    ]);
-
-    const adjustedPrice = priceRatio * Math.pow(10, Number(decA) - Number(decB));
-
-    return {
-      price: adjustedPrice,
-      poolAddress,
-      liquidity: ethers.formatEther(liquidity),
-    };
-  } catch (err) {
-    return null;
-  }
+async function getSymbol(provider: ethers.JsonRpcProvider, token: string): Promise<string> {
+  try {
+    const c = new ethers.Contract(token, ERC20_ABI, provider);
+    return await c.symbol();
+  } catch { return token.slice(0, 8); }
 }
 
 async function main() {
   const rpcUrl = process.env.RPC_URL_BASE;
-  if (!rpcUrl) throw new Error('RPC_URL_BASE not set in .env');
+  if (!rpcUrl) throw new Error('RPC_URL_BASE not set');
 
   const provider = new ethers.JsonRpcProvider(rpcUrl);
   const block    = await provider.getBlockNumber();
 
-  console.log('\n' + '='.repeat(60));
-  console.log('  BASE ARB OPPORTUNITY SCANNER');
-  console.log('='.repeat(60));
-  console.log(`  Block: ${block}`);
-  console.log(`  Time:  ${new Date().toISOString()}`);
-  console.log('='.repeat(60) + '\n');
+  console.log('\n' + '='.repeat(62));
+  console.log('  BASE CROSS-DEX ARB SCANNER v2.1');
+  console.log('  Uniswap V3 vs Aerodrome');
+  console.log('='.repeat(62));
+  console.log(`  Block: ${block} | Time: ${new Date().toISOString()}`);
+  console.log('='.repeat(62) + '\n');
 
-  const FLASHLOAN_ETH = parseFloat(process.env.FLASHLOAN_AMOUNT_ETH ?? '10');
+  const LOAN_WETH = ethers.parseEther('10');   // 10 WETH = 10e18
+  const LOAN_USDC = BigInt('10000000000');      // 10000 USDC = 10000e6
+
+  let foundAny = false;
 
   for (const pair of ARB_PAIRS) {
-    console.log(`\n📊 ${pair.name}`);
+    const symIn  = await getSymbol(provider, pair.tokenIn);
+    const symOut = await getSymbol(provider, pair.tokenOut);
+
+    // Tentukan loan amount berdasarkan token input
+    const isUsdcIn   = pair.tokenIn.toLowerCase() === BASE.USDC.toLowerCase();
+    const loanAmount = isUsdcIn ? LOAN_USDC : LOAN_WETH;
+    const loanDisplay = isUsdcIn ? '10000 USDC' : '10 WETH';
+
+    const premium   = (loanAmount * 5n) / 10000n; // 0.05% Aave premium
+    const totalDebt = loanAmount + premium;
+
+    console.log(`📊 ${pair.name} (${symIn}/${symOut})`);
     console.log(`   ${pair.description}`);
 
-    const result = await getPoolPrice(
-      provider,
-      pair.flashloanToken,
-      pair.marketToken,
-      pair.poolFee
-    );
+    // ─── Strategy 1: Uni → Aero ───
+    const uniOut1  = await getUniQuote(provider, pair.tokenIn, pair.tokenOut, pair.uniswapFee, loanAmount);
+    const aeroOut1 = uniOut1 > 0n
+      ? await getAeroQuote(provider, pair.tokenOut, pair.tokenIn, pair.aerodromeStable, uniOut1)
+      : 0n;
 
-    if (!result) {
-      console.log(`   ❌ Pool not found`);
-      continue;
-    }
+    if (uniOut1 > 0n && aeroOut1 > 0n) {
+      const profit1 = aeroOut1 > totalDebt ? aeroOut1 - totalDebt : 0n;
+      const pct1    = (Number(aeroOut1) / Number(loanAmount) - 1) * 100;
 
-    const { price, poolAddress, liquidity } = result;
+      // Format display sesuai decimals token
+      const midDisplay = isUsdcIn
+        ? (Number(uniOut1) / 1e18).toFixed(6) + ' WETH'
+        : (Number(uniOut1) / 1e6).toFixed(2) + ' USDC';
+      const outDisplay = isUsdcIn
+        ? (Number(aeroOut1) / 1e6).toFixed(4) + ' USDC'
+        : ethers.formatEther(aeroOut1) + ' WETH';
+      const profitDisplay = isUsdcIn
+        ? (Number(profit1) / 1e6).toFixed(4) + ' USDC'
+        : ethers.formatEther(profit1) + ' WETH';
 
-    // Kalau price > 1 → kita dapat lebih aToken per WETH → ada peluang
-    const hasOpportunity = price > 1.0;
-    const aavePrice      = 1.0;
-    const priceDiff      = ((price - aavePrice) / aavePrice) * 100;
-
-    console.log(`   Pool:        ${poolAddress.slice(0, 20)}...`);
-    console.log(`   Market price: ${price.toFixed(8)} (${priceDiff > 0 ? '+' : ''}${priceDiff.toFixed(4)}%)`);
-    console.log(`   Aave price:   ${aavePrice.toFixed(8)} (redeem 1:1)`);
-    console.log(`   Liquidity:    ${parseFloat(liquidity).toFixed(2)} ETH equivalent`);
-
-    if (hasOpportunity) {
-      // Hitung estimasi profit
-      const grossProfitPct = price - aavePrice;
-      const premiumPct     = AAVE_PREMIUM;
-      const netProfitPct   = grossProfitPct - premiumPct;
-
-      const grossProfitEth = FLASHLOAN_ETH * grossProfitPct;
-      const premiumEth     = FLASHLOAN_ETH * premiumPct;
-      const netProfitEth   = FLASHLOAN_ETH * netProfitPct;
-      const gasEstEth      = 0.00005; // ~$0.12 di Base
-
-      console.log(`\n   🎯 OPPORTUNITY DETECTED!`);
-      console.log(`   Flashloan:    ${FLASHLOAN_ETH} ETH`);
-      console.log(`   Gross profit: ${grossProfitEth.toFixed(6)} ETH`);
-      console.log(`   Premium:     -${premiumEth.toFixed(6)} ETH (0.09% Aave)`);
-      console.log(`   Gas est:     -${gasEstEth.toFixed(6)} ETH`);
-      console.log(`   NET PROFIT:   ${(netProfitEth - gasEstEth).toFixed(6)} ETH`);
-
-      if (netProfitEth - gasEstEth > 0) {
-        console.log(`   ✅ PROFITABLE — worth executing!`);
-      } else {
-        console.log(`   ⚠️  Not profitable after costs`);
-      }
+      console.log(`   [Uni→Aero] in=${loanDisplay} → mid=${midDisplay} → out=${outDisplay}`);
+      console.log(`              net=${pct1 >= 0 ? '+' : ''}${pct1.toFixed(4)}% | profit=${profitDisplay} ${profit1 > 0n ? '✅ PROFITABLE!' : '❌'}`);
+      if (profit1 > 0n) foundAny = true;
     } else {
-      console.log(`   ℹ️  No arb opportunity (market price ≤ Aave price)`);
+      console.log(`   [Uni→Aero] ❌ quote failed`);
     }
+
+    // ─── Strategy 2: Aero → Uni ───
+    const aeroOut2 = await getAeroQuote(provider, pair.tokenIn, pair.tokenOut, pair.aerodromeStable, loanAmount);
+    const uniOut2  = aeroOut2 > 0n
+      ? await getUniQuote(provider, pair.tokenOut, pair.tokenIn, pair.uniswapFee, aeroOut2)
+      : 0n;
+
+    if (aeroOut2 > 0n && uniOut2 > 0n) {
+      const profit2 = uniOut2 > totalDebt ? uniOut2 - totalDebt : 0n;
+      const pct2    = (Number(uniOut2) / Number(loanAmount) - 1) * 100;
+
+      const midDisplay = isUsdcIn
+        ? (Number(aeroOut2) / 1e18).toFixed(6) + ' WETH'
+        : (Number(aeroOut2) / 1e6).toFixed(2) + ' USDC';
+      const outDisplay = isUsdcIn
+        ? (Number(uniOut2) / 1e6).toFixed(4) + ' USDC'
+        : ethers.formatEther(uniOut2) + ' WETH';
+      const profitDisplay = isUsdcIn
+        ? (Number(profit2) / 1e6).toFixed(4) + ' USDC'
+        : ethers.formatEther(profit2) + ' WETH';
+
+      console.log(`   [Aero→Uni] in=${loanDisplay} → mid=${midDisplay} → out=${outDisplay}`);
+      console.log(`              net=${pct2 >= 0 ? '+' : ''}${pct2.toFixed(4)}% | profit=${profitDisplay} ${profit2 > 0n ? '✅ PROFITABLE!' : '❌'}`);
+      if (profit2 > 0n) foundAny = true;
+    } else {
+      console.log(`   [Aero→Uni] ❌ quote failed`);
+    }
+
+    console.log('');
   }
 
-  console.log('\n' + '='.repeat(60));
-  console.log('  Scan complete!');
-  console.log('='.repeat(60) + '\n');
+  console.log('='.repeat(62));
+  if (foundAny) {
+    console.log('  🎯 OPPORTUNITIES FOUND! Run: npm run bot');
+  } else {
+    console.log('  No profitable opportunities right now.');
+    console.log('  Market is efficient between Uniswap and Aerodrome.');
+  }
+  console.log('='.repeat(62) + '\n');
 }
 
-main().catch(err => {
-  console.error('Error:', err.message);
-  process.exit(1);
-});
+main().catch(err => { console.error(err.message); process.exit(1); });

@@ -1,10 +1,26 @@
 import { ethers } from 'ethers';
 import {
   BASE, ARB_PAIRS, ArbPair,
-  ERC20_ABI, UNISWAP_FACTORY_ABI, UNISWAP_POOL_ABI,
+  ERC20_ABI,
+  UNISWAP_FACTORY_ABI,
+  QUOTER_V2_ABI,
+  AERODROME_FACTORY_ABI,
+  AERODROME_ROUTER_ABI,
 } from './addresses';
 import { BotConfig } from './config';
 import { logger } from './utils/logger';
+
+// ════════════════════════════════════════════════
+// CONSTANTS
+// ════════════════════════════════════════════════
+
+// Aave V3 flashloan premium = 0.05% (bukan 0.09%!)
+const AAVE_PREMIUM_BPS = 5n;
+const BPS_DENOMINATOR  = 10000n;
+
+// Strategy IDs (harus sama dengan contract)
+export const STRATEGY_UNI_TO_AERO = 1;
+export const STRATEGY_AERO_TO_UNI = 2;
 
 // ════════════════════════════════════════════════
 // TIPE DATA
@@ -12,40 +28,22 @@ import { logger } from './utils/logger';
 
 export interface ArbOpportunity {
   pair: ArbPair;
+  strategy: number;          // 1 atau 2
+  strategyName: string;      // human readable
   flashloanAmount: bigint;
   expectedProfit: bigint;
   expectedProfitEth: string;
   profitBps: number;
-  marketPrice: number;
-  aavePrice: number;
+  uniswapAmountOut: bigint;  // output dari Uniswap
+  aerodromeAmountOut: bigint; // output dari Aerodrome
   poolAddress: string;
-  actualAmountOut: bigint;   // dari Quoter — nilai real
 }
-
-// ════════════════════════════════════════════════
-// CONSTANTS
-// ════════════════════════════════════════════════
-
-// Aave V3 flashloan premium = 0.09%
-const AAVE_PREMIUM_BPS = 5n;
-const BPS_DENOMINATOR  = 10000n;
-
-// QuoterV2 Base mainnet (Uniswap official)
-const QUOTER_V2_ADDRESS = '0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a';
-
-const QUOTER_V2_ABI = [
-  'function quoteExactInputSingle(tuple(address tokenIn, address tokenOut, uint256 amountIn, uint24 fee, uint160 sqrtPriceLimitX96) params) external returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate)',
-];
-
-const AAVE_POOL_ABI = [
-  'function getReserveNormalizedIncome(address asset) view returns (uint256)',
-];
 
 // ════════════════════════════════════════════════
 // HELPERS
 // ════════════════════════════════════════════════
 
-function calcFlashloanPremium(amount: bigint): bigint {
+function calcPremium(amount: bigint): bigint {
   return (amount * AAVE_PREMIUM_BPS) / BPS_DENOMINATOR;
 }
 
@@ -54,47 +52,25 @@ async function getDecimals(
   token: string
 ): Promise<number> {
   try {
-    const contract = new ethers.Contract(token, ERC20_ABI, provider);
-    return Number(await contract.decimals());
-  } catch {
-    return 18;
-  }
+    const c = new ethers.Contract(token, ERC20_ABI, provider);
+    return Number(await c.decimals());
+  } catch { return 18; }
 }
 
 // ════════════════════════════════════════════════
-// GET AAVE EXCHANGE RATE
-// Aave aWETH bukan 1:1 — ada accumulated interest
-// 1 aWETH = ~1.04 WETH karena interest
+// GET UNISWAP QUOTE (via QuoterV2)
+// Output aktual yang akan diterima dari Uniswap
 // ════════════════════════════════════════════════
 
-async function getAaveExchangeRate(
-  provider: ethers.JsonRpcProvider,
-  asset: string
-): Promise<number> {
-  try {
-    const pool = new ethers.Contract(BASE.AAVE_POOL, AAVE_POOL_ABI, provider);
-    const normalizedIncome = await pool.getReserveNormalizedIncome(asset);
-    // normalizedIncome dalam RAY (1e27)
-    return Number(normalizedIncome) / 1e27;
-  } catch {
-    return 1.0;
-  }
-}
-
-// ════════════════════════════════════════════════
-// GET ACTUAL QUOTE VIA UNISWAP QUOTER
-// Lebih akurat dari slot0 — tahu persis output aktual
-// ════════════════════════════════════════════════
-
-async function getActualQuote(
+async function getUniswapQuote(
   provider: ethers.JsonRpcProvider,
   tokenIn: string,
   tokenOut: string,
   fee: number,
   amountIn: bigint
-): Promise<{ amountOut: bigint; executable: boolean }> {
+): Promise<bigint> {
   try {
-    const quoter = new ethers.Contract(QUOTER_V2_ADDRESS, QUOTER_V2_ABI, provider);
+    const quoter = new ethers.Contract(BASE.QUOTER_V2, QUOTER_V2_ABI, provider);
     const result = await quoter.quoteExactInputSingle.staticCall({
       tokenIn,
       tokenOut,
@@ -102,9 +78,42 @@ async function getActualQuote(
       fee,
       sqrtPriceLimitX96: 0,
     });
-    return { amountOut: BigInt(result[0].toString()), executable: true };
+    return BigInt(result[0].toString());
   } catch {
-    return { amountOut: 0n, executable: false };
+    return 0n;
+  }
+}
+
+// ════════════════════════════════════════════════
+// GET AERODROME QUOTE (via Router.getAmountsOut)
+// Output aktual yang akan diterima dari Aerodrome
+// ════════════════════════════════════════════════
+
+async function getAerodromeQuote(
+  provider: ethers.JsonRpcProvider,
+  tokenIn: string,
+  tokenOut: string,
+  stable: boolean,
+  amountIn: bigint
+): Promise<bigint> {
+  try {
+    const router = new ethers.Contract(
+      BASE.AERODROME_ROUTER,
+      AERODROME_ROUTER_ABI,
+      provider
+    );
+
+    const routes = [{
+      from:    tokenIn,
+      to:      tokenOut,
+      stable,
+      factory: BASE.AERODROME_FACTORY,
+    }];
+
+    const amounts = await router.getAmountsOut(amountIn, routes);
+    return BigInt(amounts[amounts.length - 1].toString());
+  } catch {
+    return 0n;
   }
 }
 
@@ -112,7 +121,7 @@ async function getActualQuote(
 // GET POOL ADDRESS
 // ════════════════════════════════════════════════
 
-async function getPoolAddress(
+async function getUniswapPool(
   provider: ethers.JsonRpcProvider,
   tokenA: string,
   tokenB: string,
@@ -124,121 +133,147 @@ async function getPoolAddress(
       UNISWAP_FACTORY_ABI,
       provider
     );
-    const poolAddress = await factory.getPool(tokenA, tokenB, fee);
-    if (poolAddress === ethers.ZeroAddress) return null;
-    return poolAddress;
-  } catch {
-    return null;
-  }
+    const pool = await factory.getPool(tokenA, tokenB, fee);
+    return pool === ethers.ZeroAddress ? null : pool;
+  } catch { return null; }
 }
 
 // ════════════════════════════════════════════════
-// SCAN OPPORTUNITIES
-// Menggunakan Quoter untuk verifikasi real sebelum eksekusi
+// SCAN SATU PAIR — cek kedua arah
+// ════════════════════════════════════════════════
+
+async function scanPair(
+  provider: ethers.JsonRpcProvider,
+  pair: ArbPair,
+  flashloanAmount: bigint,
+  minProfitWei: bigint
+): Promise<ArbOpportunity[]> {
+  const opportunities: ArbOpportunity[] = [];
+
+  // Pastikan pool Uniswap ada
+  const poolAddress = await getUniswapPool(
+    provider, pair.tokenIn, pair.tokenOut, pair.uniswapFee
+  );
+  if (!poolAddress) {
+    logger.warn(`${pair.name}: Uniswap pool not found`);
+    return [];
+  }
+
+  const premium   = calcPremium(flashloanAmount);
+  const totalDebt = flashloanAmount + premium;
+
+  // ─── STRATEGY 1: Buy Uniswap → Sell Aerodrome ───
+  // Step 1: flashloanAmount tokenIn → tokenOut via Uniswap
+  const uniOut1 = await getUniswapQuote(
+    provider, pair.tokenIn, pair.tokenOut, pair.uniswapFee, flashloanAmount
+  );
+
+  if (uniOut1 > 0n) {
+    // Step 2: tokenOut → tokenIn via Aerodrome
+    const aeroOut1 = await getAerodromeQuote(
+      provider, pair.tokenOut, pair.tokenIn, pair.aerodromeStable, uniOut1
+    );
+
+    if (aeroOut1 > totalDebt) {
+      const profit = aeroOut1 - totalDebt;
+      const bps = Math.floor((Number(profit) / Number(flashloanAmount)) * 10000);
+
+      if (profit >= minProfitWei) {
+        const profitEth = ethers.formatEther(profit);
+        logger.opportunity(`${pair.name} [UniSwap→Aerodrome]`, parseFloat(profitEth), bps / 100);
+        opportunities.push({
+          pair,
+          strategy:            STRATEGY_UNI_TO_AERO,
+          strategyName:        'Uniswap→Aerodrome',
+          flashloanAmount,
+          expectedProfit:      profit,
+          expectedProfitEth:   profitEth,
+          profitBps:           bps,
+          uniswapAmountOut:    uniOut1,
+          aerodromeAmountOut:  aeroOut1,
+          poolAddress,
+        });
+      } else {
+        logger.info(`${pair.name} [Uni→Aero]: profit=${ethers.formatEther(profit)} ETH (below min)`);
+      }
+    } else {
+      logger.info(`${pair.name} [Uni→Aero]: not profitable`);
+    }
+  }
+
+  // ─── STRATEGY 2: Buy Aerodrome → Sell Uniswap ───
+  // Step 1: flashloanAmount tokenIn → tokenOut via Aerodrome
+  const aeroOut2 = await getAerodromeQuote(
+    provider, pair.tokenIn, pair.tokenOut, pair.aerodromeStable, flashloanAmount
+  );
+
+  if (aeroOut2 > 0n) {
+    // Step 2: tokenOut → tokenIn via Uniswap
+    const uniOut2 = await getUniswapQuote(
+      provider, pair.tokenOut, pair.tokenIn, pair.uniswapFee, aeroOut2
+    );
+
+    if (uniOut2 > totalDebt) {
+      const profit = uniOut2 - totalDebt;
+      const bps = Math.floor((Number(profit) / Number(flashloanAmount)) * 10000);
+
+      if (profit >= minProfitWei) {
+        const profitEth = ethers.formatEther(profit);
+        logger.opportunity(`${pair.name} [Aerodrome→Uniswap]`, parseFloat(profitEth), bps / 100);
+        opportunities.push({
+          pair,
+          strategy:            STRATEGY_AERO_TO_UNI,
+          strategyName:        'Aerodrome→Uniswap',
+          flashloanAmount,
+          expectedProfit:      profit,
+          expectedProfitEth:   profitEth,
+          profitBps:           bps,
+          uniswapAmountOut:    uniOut2,
+          aerodromeAmountOut:  aeroOut2,
+          poolAddress,
+        });
+      } else {
+        logger.info(`${pair.name} [Aero→Uni]: profit=${ethers.formatEther(profit)} ETH (below min)`);
+      }
+    } else {
+      logger.info(`${pair.name} [Aero→Uni]: not profitable`);
+    }
+  }
+
+  return opportunities;
+}
+
+// ════════════════════════════════════════════════
+// MAIN SCAN — semua pairs
 // ════════════════════════════════════════════════
 
 export async function scanOpportunities(
   config: BotConfig
 ): Promise<ArbOpportunity[]> {
-  const opportunities: ArbOpportunity[] = [];
+  const all: ArbOpportunity[] = [];
   const { provider, flashloanAmountEth, minProfitEth } = config;
-
-  // Ambil Aave exchange rate sekali untuk semua pairs
-  const aaveRate = await getAaveExchangeRate(provider, BASE.WETH);
-  logger.info(`Aave WETH rate: 1 aWETH = ${aaveRate.toFixed(6)} WETH`);
 
   for (const pair of ARB_PAIRS) {
     try {
-      // ─── Cek pool ada ───
-      const poolAddress = await getPoolAddress(
+      const opps = await scanPair(
         provider,
-        pair.flashloanToken,
-        pair.marketToken,
-        pair.poolFee
-      );
-
-      if (!poolAddress) {
-        logger.warn(`No pool found for ${pair.name}`);
-        continue;
-      }
-
-      // ─── Strategy: deposit WETH ke Aave → dapat aWETH → jual di Uniswap ───
-      // Aave rate > 1 berarti 1 WETH deposit → dapat aWETH yang bisa dijual > 1 WETH
-      //
-      // Step 1: Deposit flashloanAmount WETH ke Aave
-      //         → dapat flashloanAmount aWETH (1:1 token, tapi aWETH worth lebih)
-      // Step 2: Jual aWETH di Uniswap → dapat WETH
-      // Profit = WETH received - flashloan amount - premium
-
-      // Get actual quote: berapa WETH yang dapat kalau jual aWETH
-      const { amountOut: wethFromSell, executable } = await getActualQuote(
-        provider,
-        pair.marketToken,    // aWETH in
-        pair.flashloanToken, // WETH out
-        pair.poolFee,
-        flashloanAmountEth   // amount aWETH to sell
-      );
-
-      if (!executable) {
-        logger.info(`${pair.name}: swap not executable via Quoter`);
-        continue;
-      }
-
-      // ─── Hitung profit real ───
-      const premium   = calcFlashloanPremium(flashloanAmountEth);
-      const totalDebt = flashloanAmountEth + premium;
-
-      if (wethFromSell <= totalDebt) {
-        const diff = ethers.formatEther(totalDebt - wethFromSell);
-        logger.info(`${pair.name}: not profitable (short by ${diff} ETH)`);
-        continue;
-      }
-
-      const netProfit = wethFromSell - totalDebt;
-      const profitBps = Math.floor(
-        (Number(netProfit) / Number(flashloanAmountEth)) * 10000
-      );
-
-      const marketPrice = Number(ethers.formatEther(wethFromSell)) /
-                          Number(ethers.formatEther(flashloanAmountEth));
-
-      logger.info(
-        `${pair.name}: sell ${ethers.formatEther(flashloanAmountEth)} aWETH → ` +
-        `${ethers.formatEther(wethFromSell)} WETH | ` +
-        `profit=${ethers.formatEther(netProfit)} ETH (${profitBps} bps)`
-      );
-
-      if (netProfit < minProfitEth) continue;
-
-      logger.opportunity(
-        pair.name,
-        parseFloat(ethers.formatEther(netProfit)),
-        profitBps / 100
-      );
-
-      opportunities.push({
         pair,
-        flashloanAmount:    flashloanAmountEth,
-        expectedProfit:     netProfit,
-        expectedProfitEth:  ethers.formatEther(netProfit),
-        profitBps,
-        marketPrice,
-        aavePrice:          aaveRate,
-        poolAddress,
-        actualAmountOut:    wethFromSell,
-      });
-
+        flashloanAmountEth,
+        minProfitEth
+      );
+      all.push(...opps);
     } catch (err) {
       logger.warn(`Error scanning ${pair.name}: ${err}`);
     }
   }
 
-  opportunities.sort((a, b) => {
+  // Sort by profit tertinggi
+  all.sort((a, b) => {
     if (b.expectedProfit > a.expectedProfit) return 1;
     if (b.expectedProfit < a.expectedProfit) return -1;
     return 0;
   });
 
-  logger.scan(ARB_PAIRS?.length ?? 0, opportunities.length);
-  return opportunities;
+  logger.scan(ARB_PAIRS.length, all.length);
+  return all;
 }
