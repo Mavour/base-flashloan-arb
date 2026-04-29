@@ -20,12 +20,23 @@ export interface ArbOpportunity {
   amountIn: bigint;
   uniswapOut: bigint;
   aerodromeOut: bigint;
-  profitRaw: bigint;          // dalam tokenOut
-  profitEth: number;          // estimated dalam ETH
+  profitRaw: bigint;
+  profitEth: number;
   direction: 'UNI_TO_AERO' | 'AERO_TO_UNI';
   flashloanToken: string;
   flashloanAmount: bigint;
   timestamp: number;
+  // ── Fields tambahan agar kompatibel dengan index.ts ──
+  strategyName: string;
+  expectedProfitEth: string;
+  profitBps: number;
+  pair: {
+    name: string;
+    tokenIn: string;
+    tokenOut: string;
+    flashloanToken: string;
+    flashloanAmount: bigint;
+  };
 }
 
 // ─── Price Monitor Class ─────────────────────────────────────────────────────
@@ -34,7 +45,6 @@ export class PriceMonitor {
   private aeroRouter: ethers.Contract;
   private provider: ethers.Provider;
 
-  // Aave flashloan premium = 0.09%
   private readonly AAVE_PREMIUM_BPS = 9n;
   private readonly BPS_BASE = 10000n;
 
@@ -90,7 +100,6 @@ export class PriceMonitor {
       const amounts = await this.aeroRouter.getAmountsOut(amountIn, routes);
       return amounts[amounts.length - 1];
     } catch {
-      // Try volatile pool jika stable gagal
       if (stable) return 0n;
       try {
         const routes = [{
@@ -116,13 +125,10 @@ export class PriceMonitor {
     if (tokenOut.toLowerCase() === ADDRESSES.WETH.toLowerCase()) {
       return Number(ethers.formatUnits(profitRaw, 18));
     }
-
-    // Untuk USDC: convert via price (rough estimate $2500/ETH)
     if (tokenOut.toLowerCase() === ADDRESSES.USDC.toLowerCase()) {
       const usdcAmount = Number(ethers.formatUnits(profitRaw, 6));
       return usdcAmount / 2500;
     }
-
     return Number(ethers.formatUnits(profitRaw, decimalsOut));
   }
 
@@ -130,7 +136,6 @@ export class PriceMonitor {
   async scanPair(pair: typeof ARB_PAIRS[0]): Promise<ArbOpportunity | null> {
     const amountIn = ethers.parseUnits(pair.flashloanAmount, pair.decimalsIn);
 
-    // Quote kedua DEX secara parallel
     const [uniOut, aeroOut] = await Promise.all([
       this.quoteUniswap(pair.tokenIn, pair.tokenOut, amountIn, pair.uniswapFee),
       this.quoteAerodrome(pair.tokenIn, pair.tokenOut, amountIn),
@@ -141,7 +146,6 @@ export class PriceMonitor {
       return null;
     }
 
-    // Hitung spread
     const spreadBps = uniOut > aeroOut
       ? ((uniOut - aeroOut) * 10000n) / aeroOut
       : ((aeroOut - uniOut) * 10000n) / uniOut;
@@ -152,25 +156,16 @@ export class PriceMonitor {
       `spread=${Number(spreadBps) / 100}%`
     );
 
-    // Tentukan arah arb
-    const [bestOut, direction] = uniOut > aeroOut
-      ? [uniOut, 'UNI_TO_AERO' as const]  // Beli di Aero, jual di Uni
-      : [aeroOut, 'AERO_TO_UNI' as const]; // Beli di Uni, jual di Aero
+    const direction = uniOut > aeroOut ? 'UNI_TO_AERO' as const : 'AERO_TO_UNI' as const;
+    const worstOut  = uniOut > aeroOut ? aeroOut : uniOut;
 
-    const worstOut = uniOut > aeroOut ? aeroOut : uniOut;
-
-    // Kurangi flashloan premium dari profit
     const flashloanAmount = ethers.parseUnits(pair.flashloanAmount, pair.decimalsIn);
-    const flashloanCost = (flashloanAmount * this.AAVE_PREMIUM_BPS) / this.BPS_BASE;
+    const flashloanCost   = (flashloanAmount * this.AAVE_PREMIUM_BPS) / this.BPS_BASE;
+    const rawProfit       = (uniOut > aeroOut ? uniOut : aeroOut) - worstOut;
 
-    // Profit kasar (sebelum gas)
-    const rawProfit = bestOut - worstOut;
-
-    // Kurangi biaya flashloan (dalam tokenIn, approximate)
-    // Gas estimate: ~0.0001 ETH di Base
-    const GAS_COST_ETH = 0.0001;
-    const profitEth = await this.estimateProfitInEth(rawProfit, pair.tokenOut, pair.decimalsOut);
-    const netProfitEth = profitEth - GAS_COST_ETH - (Number(ethers.formatEther(flashloanCost)));
+    const GAS_COST_ETH  = 0.0001;
+    const profitEth     = await this.estimateProfitInEth(rawProfit, pair.tokenOut, pair.decimalsOut);
+    const netProfitEth  = profitEth - GAS_COST_ETH - Number(ethers.formatEther(flashloanCost));
 
     if (netProfitEth <= 0) {
       logger.info(`${pair.name}: not profitable (net=${netProfitEth.toFixed(6)} ETH)`);
@@ -179,8 +174,16 @@ export class PriceMonitor {
 
     logger.info(`✅ OPPORTUNITY: ${pair.name} ${direction} profit~${netProfitEth.toFixed(6)} ETH`);
 
+    const pairObj = {
+      name: pair.name,
+      tokenIn: pair.tokenIn,
+      tokenOut: pair.tokenOut,
+      flashloanToken: pair.flashloanToken,
+      flashloanAmount: flashloanAmount,
+    };
+
     return {
-      pair: pair.name,
+      pair: pairObj as any,          // kompatibel dengan index.ts (pair.name)
       tokenIn: pair.tokenIn,
       tokenOut: pair.tokenOut,
       amountIn,
@@ -190,9 +193,13 @@ export class PriceMonitor {
       profitEth: netProfitEth,
       direction,
       flashloanToken: pair.flashloanToken,
-      flashloanAmount: ethers.parseUnits(pair.flashloanAmount, pair.decimalsIn),
+      flashloanAmount,
       timestamp: Date.now(),
-    };
+      // ── Compat fields ──
+      strategyName: direction,
+      expectedProfitEth: netProfitEth.toFixed(6),
+      profitBps: Number(spreadBps),
+    } as any;
   }
 
   // ── Scan semua pairs ───────────────────────────────────────────────────────
@@ -210,4 +217,11 @@ export class PriceMonitor {
 
     return opportunities.sort((a, b) => b.profitEth - a.profitEth);
   }
+}
+
+// ─── Wrapper Function (dipanggil oleh index.ts) ───────────────────────────────
+export async function scanOpportunities(config: any): Promise<ArbOpportunity[]> {
+  const provider = new ethers.JsonRpcProvider(config.rpcUrl);
+  const monitor  = new PriceMonitor(provider);
+  return monitor.scanAll();
 }
