@@ -1,54 +1,28 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-// ════════════════════════════════════════════════════════════════
-// INTERFACES
-// ════════════════════════════════════════════════════════════════
+import "@aave/core-v3/contracts/flashloan/base/FlashLoanSimpleReceiverBase.sol";
+import "@aave/core-v3/contracts/interfaces/IPoolAddressesProvider.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-interface IERC20 {
-    function balanceOf(address account) external view returns (uint256);
-    function transfer(address to, uint256 amount) external returns (bool);
-    function approve(address spender, uint256 amount) external returns (bool);
-}
+// ── Interfaces ──────────────────────────────────────────────────────────────
 
-interface IPool {
-    function flashLoan(
-        address receiverAddress,
-        address[] calldata assets,
-        uint256[] calldata amounts,
-        uint256[] calldata interestRateModes,
-        address onBehalfOf,
-        bytes calldata params,
-        uint16 referralCode
-    ) external;
-}
-
-interface IFlashLoanSimpleReceiver {
-    function executeOperation(
-        address[] calldata assets,
-        uint256[] calldata amounts,
-        uint256[] calldata premiums,
-        address initiator,
-        bytes calldata params
-    ) external returns (bool);
-}
-
-// Uniswap V3 Router
-interface IUniswapRouter {
+interface IUniswapV3Router {
     struct ExactInputSingleParams {
         address tokenIn;
         address tokenOut;
-        uint24  fee;
+        uint24 fee;
         address recipient;
         uint256 amountIn;
         uint256 amountOutMinimum;
         uint160 sqrtPriceLimitX96;
     }
     function exactInputSingle(ExactInputSingleParams calldata params)
-        external payable returns (uint256 amountOut);
+        external returns (uint256 amountOut);
 }
 
-// Aerodrome Router
 interface IAerodromeRouter {
     struct Route {
         address from;
@@ -63,247 +37,186 @@ interface IAerodromeRouter {
         address to,
         uint256 deadline
     ) external returns (uint256[] memory amounts);
-    
-    function getAmountsOut(
-        uint256 amountIn,
-        Route[] calldata routes
-    ) external view returns (uint256[] memory amounts);
 }
 
-// ════════════════════════════════════════════════════════════════
-// MAIN CONTRACT
-// ════════════════════════════════════════════════════════════════
+// ── Contract ─────────────────────────────────────────────────────────────────
 
-/**
- * @title FlashloanArbitrage
- * @notice Cross-DEX arbitrage antara Uniswap V3 dan Aerodrome di Base.
- *         Menggunakan Aave V3 flashloan — zero capital required.
- *
- * STRATEGY A: Buy on Uniswap, Sell on Aerodrome
- * STRATEGY B: Buy on Aerodrome, Sell on Uniswap
- *
- * Bot TypeScript mendeteksi strategy mana yang profitable,
- * lalu encode ke params sebelum panggil executeArbitrage().
- */
-contract FlashloanArbitrage is IFlashLoanSimpleReceiver {
+contract FlashloanArbitrage is FlashLoanSimpleReceiverBase, ReentrancyGuard {
+    using SafeERC20 for IERC20;
 
-    // ─── Addresses (Base Mainnet) ───
-    address public constant AAVE_POOL        = 0xA238Dd80C259a72e81d7e4664a9801593F98d1c5;
-    address public constant UNISWAP_ROUTER   = 0x2626664c2603336E57B271c5C0b26F421741e481;
+    // ── Constants ────────────────────────────────────────────────────────────
+    address public constant UNISWAP_ROUTER  = 0x2626664c2603336E57B271c5C0b26F421741e481;
     address public constant AERODROME_ROUTER = 0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43;
-    // Aerodrome pool factory
-    address public constant AERO_FACTORY     = 0x420DD381b31aEf6683db6B902084cB0FFECe40Da;
+    address public constant AERODROME_FACTORY = 0x420DD381b31aEf6683db6B902084cB0FFECe40Da;
 
+    // ── State ─────────────────────────────────────────────────────────────────
     address public immutable owner;
-    bool    private locked;
+    uint256 public totalProfit;
 
-    // Strategy enum
-    uint8 public constant STRATEGY_UNI_TO_AERO  = 1; // Buy Uniswap, Sell Aerodrome
-    uint8 public constant STRATEGY_AERO_TO_UNI  = 2; // Buy Aerodrome, Sell Uniswap
+    // ── Arb params (passed via executeOperation) ──────────────────────────────
+    struct ArbParams {
+        address tokenIn;
+        address tokenOut;
+        uint24  uniswapFee;
+        bool    buyOnAero;    // true = beli di Aero jual di Uni, false = sebaliknya
+        uint256 minProfit;
+        bool    aeroStable;
+    }
 
-    // ─── Events ───
-    event ArbitrageExecuted(
+    // ── Events ────────────────────────────────────────────────────────────────
+    event ArbExecuted(
         address indexed tokenIn,
         address indexed tokenOut,
-        uint8   strategy,
         uint256 flashloanAmount,
         uint256 profit,
-        uint256 timestamp
+        bool    buyOnAero
     );
-    event ProfitWithdrawn(address token, uint256 amount);
+
+    // ── Constructor ───────────────────────────────────────────────────────────
+    constructor(address _addressProvider)
+        FlashLoanSimpleReceiverBase(IPoolAddressesProvider(_addressProvider))
+    {
+        owner = msg.sender;
+    }
 
     modifier onlyOwner() {
         require(msg.sender == owner, "Not owner");
         _;
     }
 
-    modifier nonReentrant() {
-        require(!locked, "Reentrant");
-        locked = true;
-        _;
-        locked = false;
-    }
-
-    constructor() {
-        owner = msg.sender;
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // ENTRY POINT
-    // ════════════════════════════════════════════════════════════
-
-    /**
-     * @param flashloanToken  Token yang dipinjam (biasanya WETH atau USDC)
-     * @param flashloanAmount Jumlah yang dipinjam (wei)
-     * @param tokenOut        Token intermediate (yang diswap ke)
-     * @param uniswapFee      Fee tier Uniswap pool (500, 3000, 10000)
-     * @param isStablePool    Apakah Aerodrome pool-nya stable atau volatile
-     * @param strategy        1=UniToAero, 2=AeroToUni
-     * @param minProfit       Minimum profit yang diterima
-     */
+    // ── Entry point dari bot ──────────────────────────────────────────────────
     function executeArbitrage(
         address flashloanToken,
         uint256 flashloanAmount,
-        address tokenOut,
-        uint24  uniswapFee,
-        bool    isStablePool,
-        uint8   strategy,
-        uint256 minProfit
+        ArbParams calldata params
     ) external onlyOwner nonReentrant {
-        bytes memory params = abi.encode(
-            tokenOut,
-            uniswapFee,
-            isStablePool,
-            strategy,
-            minProfit
-        );
-
-        address[] memory assets  = new address[](1);
-        uint256[] memory amounts = new uint256[](1);
-        uint256[] memory modes   = new uint256[](1);
-
-        assets[0]  = flashloanToken;
-        amounts[0] = flashloanAmount;
-        modes[0]   = 0; // no debt
-
-        IPool(AAVE_POOL).flashLoan(
+        bytes memory encodedParams = abi.encode(params);
+        POOL.flashLoanSimple(
             address(this),
-            assets,
-            amounts,
-            modes,
-            address(this),
-            params,
+            flashloanToken,
+            flashloanAmount,
+            encodedParams,
             0
         );
     }
 
-    // ════════════════════════════════════════════════════════════
-    // FLASHLOAN CALLBACK
-    // ════════════════════════════════════════════════════════════
-
+    // ── Callback dari Aave ────────────────────────────────────────────────────
     function executeOperation(
-        address[] calldata assets,
-        uint256[] calldata amounts,
-        uint256[] calldata premiums,
+        address asset,
+        uint256 amount,
+        uint256 premium,
         address initiator,
         bytes calldata params
     ) external override returns (bool) {
-        require(msg.sender == AAVE_POOL, "Caller not Aave");
-        require(initiator == address(this), "Bad initiator");
+        require(msg.sender == address(POOL), "Caller not Aave Pool");
+        require(initiator == address(this), "Invalid initiator");
 
-        // Decode params
-        (
-            address tokenOut,
-            uint24  uniswapFee,
-            bool    isStablePool,
-            uint8   strategy,
-            uint256 minProfit
-        ) = abi.decode(params, (address, uint24, bool, uint8, uint256));
+        ArbParams memory arbParams = abi.decode(params, (ArbParams));
+        uint256 amountOwed = amount + premium;
 
-        address tokenIn       = assets[0];
-        uint256 amountIn      = amounts[0];
-        uint256 premium       = premiums[0];
-        uint256 totalDebt     = amountIn + premium;
+        uint256 amountOut;
 
-        uint256 finalAmount;
-
-        if (strategy == STRATEGY_UNI_TO_AERO) {
-            // ─── Buy on Uniswap → Sell on Aerodrome ───
-            // Step 1: Swap tokenIn → tokenOut via Uniswap
-            uint256 tokenOutAmount = _swapUniswap(tokenIn, tokenOut, amountIn, uniswapFee);
-            // Step 2: Swap tokenOut → tokenIn via Aerodrome
-            finalAmount = _swapAerodrome(tokenOut, tokenIn, tokenOutAmount, isStablePool);
-
-        } else if (strategy == STRATEGY_AERO_TO_UNI) {
-            // ─── Buy on Aerodrome → Sell on Uniswap ───
-            // Step 1: Swap tokenIn → tokenOut via Aerodrome
-            uint256 tokenOutAmount = _swapAerodrome(tokenIn, tokenOut, amountIn, isStablePool);
-            // Step 2: Swap tokenOut → tokenIn via Uniswap
-            finalAmount = _swapUniswap(tokenOut, tokenIn, tokenOutAmount, uniswapFee);
-
+        if (arbParams.buyOnAero) {
+            // Step 1: Beli tokenOut di Aerodrome dengan tokenIn (flashloan)
+            amountOut = _swapAerodrome(
+                asset,
+                arbParams.tokenOut,
+                amount,
+                arbParams.aeroStable
+            );
+            // Step 2: Jual tokenOut di Uniswap, dapat tokenIn kembali
+            uint256 returned = _swapUniswap(
+                arbParams.tokenOut,
+                asset,
+                amountOut,
+                arbParams.uniswapFee
+            );
+            require(returned > amountOwed + arbParams.minProfit, "Not profitable");
+            uint256 profit = returned - amountOwed;
+            totalProfit += profit;
+            emit ArbExecuted(asset, arbParams.tokenOut, amount, profit, true);
         } else {
-            revert("Invalid strategy");
+            // Step 1: Beli tokenOut di Uniswap
+            amountOut = _swapUniswap(
+                asset,
+                arbParams.tokenOut,
+                amount,
+                arbParams.uniswapFee
+            );
+            // Step 2: Jual di Aerodrome, dapat tokenIn kembali
+            uint256 returned = _swapAerodrome(
+                arbParams.tokenOut,
+                asset,
+                amountOut,
+                arbParams.aeroStable
+            );
+            require(returned > amountOwed + arbParams.minProfit, "Not profitable");
+            uint256 profit = returned - amountOwed;
+            totalProfit += profit;
+            emit ArbExecuted(asset, arbParams.tokenOut, amount, profit, false);
         }
 
-        // ─── Validasi profit ───
-        require(finalAmount > totalDebt, "Not profitable");
-        uint256 profit = finalAmount - totalDebt;
-        require(profit >= minProfit, "Below min profit");
-
-        // ─── Approve Aave ambil kembali ───
-        IERC20(tokenIn).approve(AAVE_POOL, totalDebt);
-
-        emit ArbitrageExecuted(tokenIn, tokenOut, strategy, amountIn, profit, block.timestamp);
+        // Approve Aave untuk ambil kembali
+        IERC20(asset).safeIncreaseAllowance(address(POOL), amountOwed);
         return true;
     }
 
-    // ════════════════════════════════════════════════════════════
-    // INTERNAL SWAP HELPERS
-    // ════════════════════════════════════════════════════════════
-
+    // ── Internal: Swap di Uniswap V3 ─────────────────────────────────────────
     function _swapUniswap(
         address tokenIn,
         address tokenOut,
         uint256 amountIn,
-        uint24  fee
+        uint24 fee
     ) internal returns (uint256 amountOut) {
-        IERC20(tokenIn).approve(UNISWAP_ROUTER, amountIn);
-        amountOut = IUniswapRouter(UNISWAP_ROUTER).exactInputSingle(
-            IUniswapRouter.ExactInputSingleParams({
-                tokenIn:           tokenIn,
-                tokenOut:          tokenOut,
-                fee:               fee,
-                recipient:         address(this),
-                amountIn:          amountIn,
-                amountOutMinimum:  0,
+        IERC20(tokenIn).safeIncreaseAllowance(UNISWAP_ROUTER, amountIn);
+        amountOut = IUniswapV3Router(UNISWAP_ROUTER).exactInputSingle(
+            IUniswapV3Router.ExactInputSingleParams({
+                tokenIn: tokenIn,
+                tokenOut: tokenOut,
+                fee: fee,
+                recipient: address(this),
+                amountIn: amountIn,
+                amountOutMinimum: 0, // slippage check ada di require profit
                 sqrtPriceLimitX96: 0
             })
         );
     }
 
+    // ── Internal: Swap di Aerodrome ───────────────────────────────────────────
     function _swapAerodrome(
         address tokenIn,
         address tokenOut,
         uint256 amountIn,
-        bool    stable
+        bool stable
     ) internal returns (uint256 amountOut) {
-        IERC20(tokenIn).approve(AERODROME_ROUTER, amountIn);
-
+        IERC20(tokenIn).safeIncreaseAllowance(AERODROME_ROUTER, amountIn);
         IAerodromeRouter.Route[] memory routes = new IAerodromeRouter.Route[](1);
         routes[0] = IAerodromeRouter.Route({
-            from:    tokenIn,
-            to:      tokenOut,
-            stable:  stable,
-            factory: AERO_FACTORY
+            from: tokenIn,
+            to: tokenOut,
+            stable: stable,
+            factory: AERODROME_FACTORY
         });
-
-        uint256[] memory amounts = IAerodromeRouter(AERODROME_ROUTER).swapExactTokensForTokens(
-            amountIn,
-            0,
-            routes,
-            address(this),
-            block.timestamp + 60
-        );
-
+        uint256[] memory amounts = IAerodromeRouter(AERODROME_ROUTER)
+            .swapExactTokensForTokens(
+                amountIn,
+                0,
+                routes,
+                address(this),
+                block.timestamp + 60
+            );
         amountOut = amounts[amounts.length - 1];
     }
 
-    // ════════════════════════════════════════════════════════════
-    // OWNER FUNCTIONS
-    // ════════════════════════════════════════════════════════════
-
-    function withdrawToken(address token) external onlyOwner {
+    // ── Withdraw profit ke owner ───────────────────────────────────────────────
+    function withdrawProfit(address token) external onlyOwner {
         uint256 bal = IERC20(token).balanceOf(address(this));
         require(bal > 0, "No balance");
-        IERC20(token).transfer(owner, bal);
-        emit ProfitWithdrawn(token, bal);
+        IERC20(token).safeTransfer(owner, bal);
     }
 
-    function getPendingProfit(address token) external view returns (uint256) {
-        uint256 size;
-        assembly { size := extcodesize(token) }
-        if (size == 0) return 0;
-        return IERC20(token).balanceOf(address(this));
+    function withdrawETH() external onlyOwner {
+        payable(owner).transfer(address(this).balance);
     }
 
     receive() external payable {}
