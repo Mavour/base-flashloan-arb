@@ -1,5 +1,5 @@
 import { ethers } from 'ethers';
-import { CONTRACT_ABI } from './addresses';
+import { CONTRACT_ABI, ADDRESSES } from './addresses';
 import { BotConfig } from './config';
 import { ArbOpportunity } from './priceMonitor';
 import { logger } from './utils/logger';
@@ -19,7 +19,7 @@ export interface ExecutionResult {
 }
 
 // ════════════════════════════════════════════════
-// SIMULATE TX
+// SIMULATE TX — hanya untuk LIVE mode
 // ════════════════════════════════════════════════
 
 async function simulateTx(
@@ -36,18 +36,20 @@ async function simulateTx(
     );
 
     await contract.executeArbitrage.staticCall(
-      opp.pair.tokenIn,
+      opp.pair.flashloanToken,
       opp.flashloanAmount,
+      opp.pair.tokenIn,
       opp.pair.tokenOut,
       opp.pair.uniswapFee,
-      opp.pair.aerodromeStable,
-      opp.strategy,
-      opp.expectedProfit,
+      opp.pair.aerodromeStable ?? false,
+      opp.strategy ?? opp.direction,
+      opp.expectedProfit ?? 0n,
     );
 
     return { success: true };
   } catch (err: any) {
-    return { success: false, error: err?.reason ?? err?.message ?? String(err) };
+    const msg = err?.reason ?? err?.shortMessage ?? err?.message ?? String(err);
+    return { success: false, error: msg };
   }
 }
 
@@ -64,15 +66,16 @@ async function estimateGas(
       config.contractAddress, CONTRACT_ABI, config.wallet
     );
     const gas = await contract.executeArbitrage.estimateGas(
-      opp.pair.tokenIn,
+      opp.pair.flashloanToken,
       opp.flashloanAmount,
+      opp.pair.tokenIn,
       opp.pair.tokenOut,
       opp.pair.uniswapFee,
-      opp.pair.aerodromeStable,
-      opp.strategy,
-      opp.expectedProfit,
+      opp.pair.aerodromeStable ?? false,
+      opp.strategy ?? opp.direction,
+      opp.expectedProfit ?? 0n,
     );
-    return (gas * 130n) / 100n; // +30% buffer
+    return (gas * 130n) / 100n;
   } catch {
     return 600_000n;
   }
@@ -86,23 +89,21 @@ export async function executeArbitrage(
   config: BotConfig,
   opp: ArbOpportunity
 ): Promise<ExecutionResult> {
+  // Label token untuk logging
+  const tokenLabel =
+    opp.pair.flashloanToken?.toLowerCase() === ADDRESSES.WETH.toLowerCase() ? 'WETH' :
+    opp.pair.flashloanToken?.toLowerCase() === ADDRESSES.USDC.toLowerCase() ? 'USDC' : 'TOKEN';
+
   logger.info(`Executing: ${opp.pair.name} [${opp.strategyName}]`);
-  logger.info(`Flashloan: ${ethers.formatEther(opp.flashloanAmount)} ${opp.pair.tokenIn === '0x4200000000000000000000000000000000000006' ? 'WETH' : 'USDC'}`);
+  logger.info(`Flashloan: ${ethers.formatEther(opp.flashloanAmount)} ${tokenLabel}`);
   logger.info(`Min profit: ${opp.expectedProfitEth} ETH`);
+  logger.info(`Spread: ${(opp.profitBps / 100).toFixed(2)}%`);
 
-  // ─── 1. Simulate ───
-  logger.info('Simulating...');
-  const sim = await simulateTx(config, opp);
-
-  if (!sim.success) {
-    logger.warn(`Sim failed: ${sim.error}`);
-    return { success: false, error: `Sim failed: ${sim.error}`, isDryRun: config.isDryRun };
-  }
-  logger.success('Simulation passed!');
-
-  // ─── 2. DRY RUN ───
+  // ─── DRY RUN: skip simulation, langsung return ────────────────────────────
   if (config.isDryRun) {
-    logger.trade('DRY_RUN_TX', opp.expectedProfitEth, true);
+    logger.info('[DRY RUN] Skipping simulation — would execute:');
+    logger.info(`[DRY RUN] ${opp.pair.name} ${opp.strategyName} profit~${opp.expectedProfitEth} ETH`);
+
     return {
       success: true,
       txHash: 'DRY_RUN',
@@ -111,13 +112,23 @@ export async function executeArbitrage(
     };
   }
 
-  // ─── 3. Estimate gas & check profitability ───
+  // ─── LIVE: Simulate dulu ──────────────────────────────────────────────────
+  logger.info('Simulating...');
+  const sim = await simulateTx(config, opp);
+
+  if (!sim.success) {
+    logger.warn(`Sim failed: ${sim.error}`);
+    return { success: false, error: `Sim failed: ${sim.error}`, isDryRun: false };
+  }
+  logger.success('Simulation passed!');
+
+  // ─── Estimate gas & cek profitability ────────────────────────────────────
   const gasLimit   = await estimateGas(config, opp);
   const feeData    = await config.provider.getFeeData();
   const gasPrice   = feeData.gasPrice ?? ethers.parseUnits('0.1', 'gwei');
   const gasCostWei = gasLimit * gasPrice;
 
-  if (opp.expectedProfit <= gasCostWei) {
+  if ((opp.expectedProfit ?? 0n) <= gasCostWei) {
     return {
       success: false,
       error: `Gas cost (${ethers.formatEther(gasCostWei)} ETH) exceeds profit`,
@@ -125,7 +136,7 @@ export async function executeArbitrage(
     };
   }
 
-  // ─── 4. LIVE TX ───
+  // ─── LIVE TX ──────────────────────────────────────────────────────────────
   logger.warn('⚡ Sending LIVE transaction...');
 
   try {
@@ -134,13 +145,14 @@ export async function executeArbitrage(
     );
 
     const tx = await contract.executeArbitrage(
-      opp.pair.tokenIn,
+      opp.pair.flashloanToken,
       opp.flashloanAmount,
+      opp.pair.tokenIn,
       opp.pair.tokenOut,
       opp.pair.uniswapFee,
-      opp.pair.aerodromeStable,
-      opp.strategy,
-      opp.expectedProfit,
+      opp.pair.aerodromeStable ?? false,
+      opp.strategy ?? opp.direction,
+      opp.expectedProfit ?? 0n,
       {
         gasLimit,
         maxPriorityFeePerGas: config.maxPriorityFeeGwei,
@@ -187,14 +199,14 @@ export async function withdrawProfit(
       config.contractAddress, CONTRACT_ABI, config.wallet
     );
 
-    const pending = await contract.getPendingProfit(token);
+    const pending = await contract.getPendingProfit();
     if (pending === 0n) {
       logger.info(`No profit to withdraw for ${token}`);
       return;
     }
 
-    logger.info(`Withdrawing ${ethers.formatEther(pending)} from contract...`);
-    const tx = await contract.withdrawToken(token);
+    logger.info(`Withdrawing ${ethers.formatEther(pending)} ETH from contract...`);
+    const tx = await contract.withdrawProfit();
     await tx.wait(1);
     logger.success(`Withdrawn! TX: ${tx.hash}`);
   } catch (err) {
