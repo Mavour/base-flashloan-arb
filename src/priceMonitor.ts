@@ -4,15 +4,22 @@ import { ADDRESSES, ARB_PAIRS } from './addresses';
 import { logger } from './utils/logger';
 
 // ─── ABIs ────────────────────────────────────────────────────────────────────
-const UNISWAP_QUOTER_ABI = [
-  'function quoteExactInputSingle((address tokenIn, address tokenOut, uint256 amountIn, uint24 fee, uint160 sqrtPriceLimitX96)) external returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate)',
+const FACTORY_ABI = [
+  'function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool)',
+];
+
+const POOL_ABI = [
+  'function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
+  'function token0() external view returns (address)',
+  'function token1() external view returns (address)',
+  'function liquidity() external view returns (uint128)',
 ];
 
 const AERODROME_ROUTER_ABI = [
   'function getAmountsOut(uint256 amountIn, (address from, address to, bool stable, address factory)[] routes) external view returns (uint256[] amounts)',
 ];
 
-// Fee tiers yang akan dicoba secara berurutan
+// Fee tiers di Uniswap V3
 const UNI_FEE_TIERS = [500, 3000, 10000, 100];
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -36,66 +43,126 @@ export interface ArbOpportunity {
 
 // ─── Price Monitor Class ─────────────────────────────────────────────────────
 export class PriceMonitor {
-  private uniQuoter: ethers.Contract;
+  private factory: ethers.Contract;
   private aeroRouter: ethers.Contract;
   private provider: ethers.Provider;
 
   private readonly AAVE_PREMIUM_BPS = 9n;
-  private readonly BPS_BASE = 10000n;
+  private readonly BPS_BASE         = 10000n;
 
   constructor(provider: ethers.Provider) {
-    this.provider = provider;
-    this.uniQuoter = new ethers.Contract(
-      ADDRESSES.UNISWAP_V3_QUOTER,
-      UNISWAP_QUOTER_ABI,
-      provider
-    );
-    this.aeroRouter = new ethers.Contract(
-      ADDRESSES.AERODROME_ROUTER,
-      AERODROME_ROUTER_ABI,
-      provider
-    );
+    this.provider   = provider;
+    this.factory    = new ethers.Contract(ADDRESSES.UNISWAP_V3_FACTORY, FACTORY_ABI, provider);
+    this.aeroRouter = new ethers.Contract(ADDRESSES.AERODROME_ROUTER, AERODROME_ROUTER_ABI, provider);
   }
 
-  // ── Quote Uniswap V3 — coba semua fee tier, ambil yang terbaik ─────────────
-  private async quoteUniswap(
+  // ── Hitung amountOut dari sqrtPriceX96 ────────────────────────────────────
+  private calcAmountOut(
+    sqrtPriceX96: bigint,
+    amountIn: bigint,
+    tokenIn: string,
+    token0: string,
+    decimalsIn: number,
+    decimalsOut: number
+  ): bigint {
+    try {
+      const Q96 = 2n ** 96n;
+      // price = (sqrtPriceX96 / Q96)^2  → token1 per token0
+      // Jika tokenIn == token0: amountOut = amountIn * price
+      // Jika tokenIn == token1: amountOut = amountIn / price
+
+      const isToken0 = tokenIn.toLowerCase() === token0.toLowerCase();
+
+      // Gunakan presisi tinggi (scale 1e18)
+      const SCALE = 10n ** 18n;
+
+      if (isToken0) {
+        // price = sqrtP^2 / Q96^2
+        const numerator   = sqrtPriceX96 * sqrtPriceX96 * SCALE;
+        const denominator = Q96 * Q96;
+        const priceScaled = numerator / denominator;
+        // Adjust decimals
+        const decimalAdj  = 10n ** BigInt(Math.abs(decimalsIn - decimalsOut));
+        if (decimalsIn >= decimalsOut) {
+          return amountIn * priceScaled / SCALE / decimalAdj;
+        } else {
+          return amountIn * priceScaled * decimalAdj / SCALE;
+        }
+      } else {
+        // price = Q96^2 / sqrtP^2
+        const numerator   = Q96 * Q96 * SCALE;
+        const denominator = sqrtPriceX96 * sqrtPriceX96;
+        const priceScaled = numerator / denominator;
+        const decimalAdj  = 10n ** BigInt(Math.abs(decimalsIn - decimalsOut));
+        if (decimalsIn >= decimalsOut) {
+          return amountIn * priceScaled / SCALE / decimalAdj;
+        } else {
+          return amountIn * priceScaled * decimalAdj / SCALE;
+        }
+      }
+    } catch {
+      return 0n;
+    }
+  }
+
+  // ── Quote Uniswap V3 via Pool slot0 ───────────────────────────────────────
+  async quoteUniswap(
     tokenIn: string,
     tokenOut: string,
     amountIn: bigint,
+    decimalsIn: number,
+    decimalsOut: number,
     preferredFee: number
-  ): Promise<{ amountOut: bigint; fee: number }> {
-    // Prioritaskan fee tier dari config, lalu coba sisanya
-    const feesToTry = [
-      preferredFee,
-      ...UNI_FEE_TIERS.filter(f => f !== preferredFee),
-    ];
+  ): Promise<{ amountOut: bigint; fee: number; poolAddress: string }> {
+    const feesToTry = [preferredFee, ...UNI_FEE_TIERS.filter(f => f !== preferredFee)];
 
-    let bestOut = 0n;
-    let bestFee = preferredFee;
+    let bestOut     = 0n;
+    let bestFee     = preferredFee;
+    let bestPool    = ethers.ZeroAddress;
 
     for (const fee of feesToTry) {
       try {
-        const [amountOut] = await this.uniQuoter.quoteExactInputSingle.staticCall({
+        const poolAddress: string = await this.factory.getPool(tokenIn, tokenOut, fee);
+        if (!poolAddress || poolAddress === ethers.ZeroAddress) continue;
+
+        const pool = new ethers.Contract(poolAddress, POOL_ABI, this.provider);
+        const [slot0Data, token0]: [any, string] = await Promise.all([
+          pool.slot0(),
+          pool.token0(),
+        ]);
+
+        const sqrtPriceX96: bigint = slot0Data[0];
+        if (sqrtPriceX96 === 0n) continue;
+
+        // Kurangi fee dari amountIn
+        const feeAmount  = amountIn * BigInt(fee) / 1000000n;
+        const amountAfterFee = amountIn - feeAmount;
+
+        const amountOut = this.calcAmountOut(
+          sqrtPriceX96,
+          amountAfterFee,
           tokenIn,
-          tokenOut,
-          amountIn,
-          fee,
-          sqrtPriceLimitX96: 0n,
-        });
+          token0,
+          decimalsIn,
+          decimalsOut
+        );
+
+        logger.info(`  Uni pool ${fee}: ${poolAddress.slice(0, 10)}... out=${amountOut.toString()}`);
+
         if (amountOut > bestOut) {
-          bestOut = amountOut;
-          bestFee = fee;
+          bestOut  = amountOut;
+          bestFee  = fee;
+          bestPool = poolAddress;
         }
-      } catch {
-        // Pool tidak ada untuk fee tier ini, lanjut ke berikutnya
+      } catch (e) {
         continue;
       }
     }
 
-    return { amountOut: bestOut, fee: bestFee };
+    return { amountOut: bestOut, fee: bestFee, poolAddress: bestPool };
   }
 
-  // ── Quote Aerodrome — coba volatile dulu, lalu stable ─────────────────────
+  // ── Quote Aerodrome ────────────────────────────────────────────────────────
   private async quoteAerodrome(
     tokenIn: string,
     tokenOut: string,
@@ -106,13 +173,13 @@ export class PriceMonitor {
     for (const stable of [false, true]) {
       try {
         const routes = [{
-          from: tokenIn,
-          to: tokenOut,
+          from:    tokenIn,
+          to:      tokenOut,
           stable,
           factory: ADDRESSES.AERODROME_FACTORY,
         }];
         const amounts = await this.aeroRouter.getAmountsOut(amountIn, routes);
-        const out = amounts[amounts.length - 1];
+        const out: bigint = amounts[amounts.length - 1];
         if (out > bestOut) bestOut = out;
       } catch {
         continue;
@@ -123,17 +190,16 @@ export class PriceMonitor {
   }
 
   // ── Estimasi profit dalam ETH ──────────────────────────────────────────────
-  private async estimateProfitInEth(
+  private estimateProfitInEth(
     profitRaw: bigint,
     tokenOut: string,
     decimalsOut: number
-  ): Promise<number> {
+  ): number {
     if (tokenOut.toLowerCase() === ADDRESSES.WETH.toLowerCase()) {
       return Number(ethers.formatUnits(profitRaw, 18));
     }
     if (tokenOut.toLowerCase() === ADDRESSES.USDC.toLowerCase()) {
-      const usdcAmount = Number(ethers.formatUnits(profitRaw, 6));
-      return usdcAmount / 2500;
+      return Number(ethers.formatUnits(profitRaw, 6)) / 2500;
     }
     return Number(ethers.formatUnits(profitRaw, decimalsOut));
   }
@@ -143,7 +209,14 @@ export class PriceMonitor {
     const amountIn = ethers.parseUnits(pair.flashloanAmount, pair.decimalsIn);
 
     const [uniResult, aeroOut] = await Promise.all([
-      this.quoteUniswap(pair.tokenIn, pair.tokenOut, amountIn, pair.uniswapFee),
+      this.quoteUniswap(
+        pair.tokenIn,
+        pair.tokenOut,
+        amountIn,
+        pair.decimalsIn,
+        pair.decimalsOut,
+        pair.uniswapFee
+      ),
       this.quoteAerodrome(pair.tokenIn, pair.tokenOut, amountIn),
     ]);
 
@@ -151,8 +224,9 @@ export class PriceMonitor {
 
     if (uniOut === 0n || aeroOut === 0n) {
       logger.warn(
-        `${pair.name}: quote failed (uni=${uniOut} aero=${aeroOut}) ` +
-        `[best uni fee: ${uniResult.fee}]`
+        `${pair.name}: quote failed ` +
+        `(uni=${uniOut} fee=${uniResult.fee} pool=${uniResult.poolAddress.slice(0,10)}... ` +
+        `aero=${aeroOut})`
       );
       return null;
     }
@@ -162,8 +236,8 @@ export class PriceMonitor {
       : ((aeroOut - uniOut) * 10000n) / uniOut;
 
     logger.info(
-      `${pair.name}: UNI=${ethers.formatUnits(uniOut, pair.decimalsOut)} ` +
-      `(fee=${uniResult.fee}) ` +
+      `${pair.name}: ` +
+      `UNI=${ethers.formatUnits(uniOut, pair.decimalsOut)} (fee=${uniResult.fee}) ` +
       `AERO=${ethers.formatUnits(aeroOut, pair.decimalsOut)} ` +
       `spread=${Number(spreadBps) / 100}%`
     );
@@ -177,7 +251,7 @@ export class PriceMonitor {
     const flashloanCost   = (flashloanAmount * this.AAVE_PREMIUM_BPS) / this.BPS_BASE;
     const GAS_COST_ETH    = 0.0001;
 
-    const profitEth    = await this.estimateProfitInEth(rawProfit, pair.tokenOut, pair.decimalsOut);
+    const profitEth    = this.estimateProfitInEth(rawProfit, pair.tokenOut, pair.decimalsOut);
     const netProfitEth = profitEth - GAS_COST_ETH - Number(ethers.formatEther(flashloanCost));
 
     if (netProfitEth <= 0) {
@@ -189,27 +263,27 @@ export class PriceMonitor {
 
     return {
       pair: {
-        name: pair.name,
-        tokenIn: pair.tokenIn,
-        tokenOut: pair.tokenOut,
+        name:           pair.name,
+        tokenIn:        pair.tokenIn,
+        tokenOut:       pair.tokenOut,
         flashloanToken: pair.flashloanToken,
-        flashloanAmount: flashloanAmount,
-        uniswapFee: uniResult.fee,  // pakai fee terbaik yang ditemukan
+        flashloanAmount,
+        uniswapFee:     uniResult.fee,
       },
-      tokenIn: pair.tokenIn,
-      tokenOut: pair.tokenOut,
+      tokenIn:          pair.tokenIn,
+      tokenOut:         pair.tokenOut,
       amountIn,
-      uniswapOut: uniOut,
-      aerodromeOut: aeroOut,
-      profitRaw: rawProfit,
-      profitEth: netProfitEth,
+      uniswapOut:       uniOut,
+      aerodromeOut:     aeroOut,
+      profitRaw:        rawProfit,
+      profitEth:        netProfitEth,
       direction,
-      flashloanToken: pair.flashloanToken,
+      flashloanToken:   pair.flashloanToken,
       flashloanAmount,
-      timestamp: Date.now(),
-      strategyName: direction,
+      timestamp:        Date.now(),
+      strategyName:     direction,
       expectedProfitEth: netProfitEth.toFixed(6),
-      profitBps: Number(spreadBps),
+      profitBps:        Number(spreadBps),
     };
   }
 
