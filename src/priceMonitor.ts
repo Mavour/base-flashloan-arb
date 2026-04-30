@@ -12,6 +12,9 @@ const AERODROME_ROUTER_ABI = [
   'function getAmountsOut(uint256 amountIn, (address from, address to, bool stable, address factory)[] routes) external view returns (uint256[] amounts)',
 ];
 
+// Fee tiers yang akan dicoba secara berurutan
+const UNI_FEE_TIERS = [500, 3000, 10000, 100];
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 export interface ArbOpportunity {
   pair: any;
@@ -54,58 +57,69 @@ export class PriceMonitor {
     );
   }
 
-  // ── Quote Uniswap V3 ───────────────────────────────────────────────────────
+  // ── Quote Uniswap V3 — coba semua fee tier, ambil yang terbaik ─────────────
   private async quoteUniswap(
     tokenIn: string,
     tokenOut: string,
     amountIn: bigint,
-    fee: number
-  ): Promise<bigint> {
-    try {
-      const [amountOut] = await this.uniQuoter.quoteExactInputSingle.staticCall({
-        tokenIn,
-        tokenOut,
-        amountIn,
-        fee,
-        sqrtPriceLimitX96: 0n,
-      });
-      return amountOut;
-    } catch {
-      return 0n;
+    preferredFee: number
+  ): Promise<{ amountOut: bigint; fee: number }> {
+    // Prioritaskan fee tier dari config, lalu coba sisanya
+    const feesToTry = [
+      preferredFee,
+      ...UNI_FEE_TIERS.filter(f => f !== preferredFee),
+    ];
+
+    let bestOut = 0n;
+    let bestFee = preferredFee;
+
+    for (const fee of feesToTry) {
+      try {
+        const [amountOut] = await this.uniQuoter.quoteExactInputSingle.staticCall({
+          tokenIn,
+          tokenOut,
+          amountIn,
+          fee,
+          sqrtPriceLimitX96: 0n,
+        });
+        if (amountOut > bestOut) {
+          bestOut = amountOut;
+          bestFee = fee;
+        }
+      } catch {
+        // Pool tidak ada untuk fee tier ini, lanjut ke berikutnya
+        continue;
+      }
     }
+
+    return { amountOut: bestOut, fee: bestFee };
   }
 
-  // ── Quote Aerodrome ────────────────────────────────────────────────────────
+  // ── Quote Aerodrome — coba volatile dulu, lalu stable ─────────────────────
   private async quoteAerodrome(
     tokenIn: string,
     tokenOut: string,
-    amountIn: bigint,
-    stable: boolean = false
+    amountIn: bigint
   ): Promise<bigint> {
-    try {
-      const routes = [{
-        from: tokenIn,
-        to: tokenOut,
-        stable,
-        factory: ADDRESSES.AERODROME_FACTORY,
-      }];
-      const amounts = await this.aeroRouter.getAmountsOut(amountIn, routes);
-      return amounts[amounts.length - 1];
-    } catch {
-      if (stable) return 0n;
+    let bestOut = 0n;
+
+    for (const stable of [false, true]) {
       try {
         const routes = [{
           from: tokenIn,
           to: tokenOut,
-          stable: false,
+          stable,
           factory: ADDRESSES.AERODROME_FACTORY,
         }];
         const amounts = await this.aeroRouter.getAmountsOut(amountIn, routes);
-        return amounts[amounts.length - 1];
+        const out = amounts[amounts.length - 1];
+        if (out > bestOut) bestOut = out;
       } catch {
-        return 0n;
+        continue;
       }
     }
+
+    return bestOut;
   }
 
   // ── Estimasi profit dalam ETH ──────────────────────────────────────────────
@@ -128,13 +142,18 @@ export class PriceMonitor {
   async scanPair(pair: typeof ARB_PAIRS[0]): Promise<ArbOpportunity | null> {
     const amountIn = ethers.parseUnits(pair.flashloanAmount, pair.decimalsIn);
 
-    const [uniOut, aeroOut] = await Promise.all([
+    const [uniResult, aeroOut] = await Promise.all([
       this.quoteUniswap(pair.tokenIn, pair.tokenOut, amountIn, pair.uniswapFee),
       this.quoteAerodrome(pair.tokenIn, pair.tokenOut, amountIn),
     ]);
 
+    const uniOut = uniResult.amountOut;
+
     if (uniOut === 0n || aeroOut === 0n) {
-      logger.warn(`${pair.name}: quote failed (uni=${uniOut} aero=${aeroOut})`);
+      logger.warn(
+        `${pair.name}: quote failed (uni=${uniOut} aero=${aeroOut}) ` +
+        `[best uni fee: ${uniResult.fee}]`
+      );
       return null;
     }
 
@@ -144,6 +163,7 @@ export class PriceMonitor {
 
     logger.info(
       `${pair.name}: UNI=${ethers.formatUnits(uniOut, pair.decimalsOut)} ` +
+      `(fee=${uniResult.fee}) ` +
       `AERO=${ethers.formatUnits(aeroOut, pair.decimalsOut)} ` +
       `spread=${Number(spreadBps) / 100}%`
     );
@@ -174,6 +194,7 @@ export class PriceMonitor {
         tokenOut: pair.tokenOut,
         flashloanToken: pair.flashloanToken,
         flashloanAmount: flashloanAmount,
+        uniswapFee: uniResult.fee,  // pakai fee terbaik yang ditemukan
       },
       tokenIn: pair.tokenIn,
       tokenOut: pair.tokenOut,
@@ -210,7 +231,6 @@ export class PriceMonitor {
 }
 
 // ─── Wrapper Function (dipanggil oleh index.ts) ───────────────────────────────
-// Pakai config.provider yang sudah dibuat di config.ts — tidak buat provider baru
 export async function scanOpportunities(config: any): Promise<ArbOpportunity[]> {
   const monitor = new PriceMonitor(config.provider);
   return monitor.scanAll();
