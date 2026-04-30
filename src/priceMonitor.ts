@@ -11,16 +11,13 @@ const FACTORY_ABI = [
 const POOL_ABI = [
   'function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
   'function token0() external view returns (address)',
-  'function token1() external view returns (address)',
-  'function liquidity() external view returns (uint128)',
 ];
 
 const AERODROME_ROUTER_ABI = [
   'function getAmountsOut(uint256 amountIn, (address from, address to, bool stable, address factory)[] routes) external view returns (uint256[] amounts)',
 ];
 
-// Fee tiers di Uniswap V3
-const UNI_FEE_TIERS = [500, 3000, 10000, 100];
+const UNI_FEE_TIERS = [500, 3000, 100, 10000];
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 export interface ArbOpportunity {
@@ -56,49 +53,36 @@ export class PriceMonitor {
     this.aeroRouter = new ethers.Contract(ADDRESSES.AERODROME_ROUTER, AERODROME_ROUTER_ABI, provider);
   }
 
-  // ── Hitung amountOut dari sqrtPriceX96 ────────────────────────────────────
+  // ── Hitung amountOut dari sqrtPriceX96 (raw values, NO decimal adjustment) ─
+  // Formula Uniswap V3:
+  //   price = (sqrtP / 2^96)^2 = token1_raw / token0_raw
+  //
+  //   tokenIn=token0 → amountOut = amountIn * sqrtP / 2^96 * sqrtP / 2^96
+  //   tokenIn=token1 → amountOut = amountIn * 2^96 / sqrtP * 2^96 / sqrtP
+  //
+  // Step-by-step division menghindari integer overflow
   private calcAmountOut(
     sqrtPriceX96: bigint,
     amountIn: bigint,
     tokenIn: string,
     token0: string,
-    decimalsIn: number,
-    decimalsOut: number
   ): bigint {
+    if (sqrtPriceX96 === 0n || amountIn === 0n) return 0n;
+
+    const Q96 = 2n ** 96n;
+    const isToken0 = tokenIn.toLowerCase() === token0.toLowerCase();
+
     try {
-      const Q96 = 2n ** 96n;
-      // price = (sqrtPriceX96 / Q96)^2  → token1 per token0
-      // Jika tokenIn == token0: amountOut = amountIn * price
-      // Jika tokenIn == token1: amountOut = amountIn / price
-
-      const isToken0 = tokenIn.toLowerCase() === token0.toLowerCase();
-
-      // Gunakan presisi tinggi (scale 1e18)
-      const SCALE = 10n ** 18n;
-
       if (isToken0) {
-        // price = sqrtP^2 / Q96^2
-        const numerator   = sqrtPriceX96 * sqrtPriceX96 * SCALE;
-        const denominator = Q96 * Q96;
-        const priceScaled = numerator / denominator;
-        // Adjust decimals
-        const decimalAdj  = 10n ** BigInt(Math.abs(decimalsIn - decimalsOut));
-        if (decimalsIn >= decimalsOut) {
-          return amountIn * priceScaled / SCALE / decimalAdj;
-        } else {
-          return amountIn * priceScaled * decimalAdj / SCALE;
-        }
+        // token0 → token1: multiply by price (sqrtP^2 / Q96^2)
+        // amountOut = amountIn * sqrtP / Q96 * sqrtP / Q96
+        const step1 = amountIn * sqrtPriceX96 / Q96;
+        return step1 * sqrtPriceX96 / Q96;
       } else {
-        // price = Q96^2 / sqrtP^2
-        const numerator   = Q96 * Q96 * SCALE;
-        const denominator = sqrtPriceX96 * sqrtPriceX96;
-        const priceScaled = numerator / denominator;
-        const decimalAdj  = 10n ** BigInt(Math.abs(decimalsIn - decimalsOut));
-        if (decimalsIn >= decimalsOut) {
-          return amountIn * priceScaled / SCALE / decimalAdj;
-        } else {
-          return amountIn * priceScaled * decimalAdj / SCALE;
-        }
+        // token1 → token0: divide by price (Q96^2 / sqrtP^2)
+        // amountOut = amountIn * Q96 / sqrtP * Q96 / sqrtP
+        const step1 = amountIn * Q96 / sqrtPriceX96;
+        return step1 * Q96 / sqrtPriceX96;
       }
     } catch {
       return 0n;
@@ -110,15 +94,13 @@ export class PriceMonitor {
     tokenIn: string,
     tokenOut: string,
     amountIn: bigint,
-    decimalsIn: number,
-    decimalsOut: number,
     preferredFee: number
   ): Promise<{ amountOut: bigint; fee: number; poolAddress: string }> {
     const feesToTry = [preferredFee, ...UNI_FEE_TIERS.filter(f => f !== preferredFee)];
 
-    let bestOut     = 0n;
-    let bestFee     = preferredFee;
-    let bestPool    = ethers.ZeroAddress;
+    let bestOut  = 0n;
+    let bestFee  = preferredFee;
+    let bestPool = ethers.ZeroAddress;
 
     for (const fee of feesToTry) {
       try {
@@ -134,27 +116,18 @@ export class PriceMonitor {
         const sqrtPriceX96: bigint = slot0Data[0];
         if (sqrtPriceX96 === 0n) continue;
 
-        // Kurangi fee dari amountIn
-        const feeAmount  = amountIn * BigInt(fee) / 1000000n;
+        // Kurangi fee dari amountIn (dalam bps per million)
+        const feeAmount      = amountIn * BigInt(fee) / 1_000_000n;
         const amountAfterFee = amountIn - feeAmount;
 
-        const amountOut = this.calcAmountOut(
-          sqrtPriceX96,
-          amountAfterFee,
-          tokenIn,
-          token0,
-          decimalsIn,
-          decimalsOut
-        );
-
-        logger.info(`  Uni pool ${fee}: ${poolAddress.slice(0, 10)}... out=${amountOut.toString()}`);
+        const amountOut = this.calcAmountOut(sqrtPriceX96, amountAfterFee, tokenIn, token0);
 
         if (amountOut > bestOut) {
           bestOut  = amountOut;
           bestFee  = fee;
           bestPool = poolAddress;
         }
-      } catch (e) {
+      } catch {
         continue;
       }
     }
@@ -169,15 +142,9 @@ export class PriceMonitor {
     amountIn: bigint
   ): Promise<bigint> {
     let bestOut = 0n;
-
     for (const stable of [false, true]) {
       try {
-        const routes = [{
-          from:    tokenIn,
-          to:      tokenOut,
-          stable,
-          factory: ADDRESSES.AERODROME_FACTORY,
-        }];
+        const routes = [{ from: tokenIn, to: tokenOut, stable, factory: ADDRESSES.AERODROME_FACTORY }];
         const amounts = await this.aeroRouter.getAmountsOut(amountIn, routes);
         const out: bigint = amounts[amounts.length - 1];
         if (out > bestOut) bestOut = out;
@@ -185,23 +152,18 @@ export class PriceMonitor {
         continue;
       }
     }
-
     return bestOut;
   }
 
   // ── Estimasi profit dalam ETH ──────────────────────────────────────────────
-  private estimateProfitInEth(
-    profitRaw: bigint,
-    tokenOut: string,
-    decimalsOut: number
-  ): number {
+  private estimateProfitInEth(profitRaw: bigint, tokenOut: string): number {
     if (tokenOut.toLowerCase() === ADDRESSES.WETH.toLowerCase()) {
       return Number(ethers.formatUnits(profitRaw, 18));
     }
     if (tokenOut.toLowerCase() === ADDRESSES.USDC.toLowerCase()) {
       return Number(ethers.formatUnits(profitRaw, 6)) / 2500;
     }
-    return Number(ethers.formatUnits(profitRaw, decimalsOut));
+    return Number(ethers.formatUnits(profitRaw, 18));
   }
 
   // ── Scan satu pair ─────────────────────────────────────────────────────────
@@ -209,14 +171,7 @@ export class PriceMonitor {
     const amountIn = ethers.parseUnits(pair.flashloanAmount, pair.decimalsIn);
 
     const [uniResult, aeroOut] = await Promise.all([
-      this.quoteUniswap(
-        pair.tokenIn,
-        pair.tokenOut,
-        amountIn,
-        pair.decimalsIn,
-        pair.decimalsOut,
-        pair.uniswapFee
-      ),
+      this.quoteUniswap(pair.tokenIn, pair.tokenOut, amountIn, pair.uniswapFee),
       this.quoteAerodrome(pair.tokenIn, pair.tokenOut, amountIn),
     ]);
 
@@ -225,8 +180,9 @@ export class PriceMonitor {
     if (uniOut === 0n || aeroOut === 0n) {
       logger.warn(
         `${pair.name}: quote failed ` +
-        `(uni=${uniOut} fee=${uniResult.fee} pool=${uniResult.poolAddress.slice(0,10)}... ` +
-        `aero=${aeroOut})`
+        `(uni=${ethers.formatUnits(uniOut, pair.decimalsOut)} ` +
+        `fee=${uniResult.fee} ` +
+        `aero=${ethers.formatUnits(aeroOut, pair.decimalsOut)})`
       );
       return null;
     }
@@ -251,7 +207,7 @@ export class PriceMonitor {
     const flashloanCost   = (flashloanAmount * this.AAVE_PREMIUM_BPS) / this.BPS_BASE;
     const GAS_COST_ETH    = 0.0001;
 
-    const profitEth    = this.estimateProfitInEth(rawProfit, pair.tokenOut, pair.decimalsOut);
+    const profitEth    = this.estimateProfitInEth(rawProfit, pair.tokenOut);
     const netProfitEth = profitEth - GAS_COST_ETH - Number(ethers.formatEther(flashloanCost));
 
     if (netProfitEth <= 0) {
@@ -263,12 +219,12 @@ export class PriceMonitor {
 
     return {
       pair: {
-        name:           pair.name,
-        tokenIn:        pair.tokenIn,
-        tokenOut:       pair.tokenOut,
+        name: pair.name,
+        tokenIn: pair.tokenIn,
+        tokenOut: pair.tokenOut,
         flashloanToken: pair.flashloanToken,
         flashloanAmount,
-        uniswapFee:     uniResult.fee,
+        uniswapFee: uniResult.fee,
       },
       tokenIn:          pair.tokenIn,
       tokenOut:         pair.tokenOut,
