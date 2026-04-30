@@ -9,9 +9,34 @@ export const CONTRACT_ABI = [
   'function owner() view returns (address)',
 ];
 
-// ─── Quoter V2 ABI (dipakai checkOpportunity.ts) ─────────────────────────────
+// ─── Quoter V2 ABI — ethers v6 compatible ────────────────────────────────────
+// QuoterV2 bukan pure view, harus dipanggil via staticCall
 export const QUOTER_V2_ABI = [
-  'function quoteExactInputSingle((address tokenIn, address tokenOut, uint256 amountIn, uint24 fee, uint160 sqrtPriceLimitX96) params) external returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate)',
+  {
+    inputs: [
+      {
+        components: [
+          { internalType: 'address', name: 'tokenIn',           type: 'address' },
+          { internalType: 'address', name: 'tokenOut',          type: 'address' },
+          { internalType: 'uint256', name: 'amountIn',          type: 'uint256' },
+          { internalType: 'uint24',  name: 'fee',               type: 'uint24'  },
+          { internalType: 'uint160', name: 'sqrtPriceLimitX96', type: 'uint160' },
+        ],
+        internalType: 'struct IQuoterV2.QuoteExactInputSingleParams',
+        name: 'params',
+        type: 'tuple',
+      },
+    ],
+    name: 'quoteExactInputSingle',
+    outputs: [
+      { internalType: 'uint256', name: 'amountOut',                  type: 'uint256' },
+      { internalType: 'uint160', name: 'sqrtPriceX96After',          type: 'uint160' },
+      { internalType: 'uint32',  name: 'initializedTicksCrossed',    type: 'uint32'  },
+      { internalType: 'uint256', name: 'gasEstimate',                type: 'uint256' },
+    ],
+    stateMutability: 'nonpayable',
+    type: 'function',
+  },
 ];
 
 // ─── Aerodrome Router ABI ─────────────────────────────────────────────────────
@@ -31,8 +56,8 @@ export const ERC20_ABI = [
 // ─── Addresses ────────────────────────────────────────────────────────────────
 export const ADDRESSES = {
   // Aave V3 Base
-  AAVE_POOL:              '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5',
-  AAVE_POOL_DATA_PROVIDER:'0x2d8A3C5677189723C4cB8873CfC9C8976dfe4C',
+  AAVE_POOL:               '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5',
+  AAVE_POOL_DATA_PROVIDER: '0x2d8A3C5677189723C4cB8873CfC9C8976dfe4C',
 
   // Tokens
   WETH:  '0x4200000000000000000000000000000000000006',
@@ -54,9 +79,7 @@ export const ADDRESSES = {
 };
 
 // ─── BASE alias (dipakai checkOpportunity.ts) ─────────────────────────────────
-export const BASE = {
-  ...ADDRESSES,
-};
+export const BASE = { ...ADDRESSES };
 
 // ─── Pairs yang akan di-scan ──────────────────────────────────────────────────
 export const ARB_PAIRS = [
