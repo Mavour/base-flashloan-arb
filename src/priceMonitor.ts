@@ -21,7 +21,18 @@ const UNI_FEE_TIERS = [500, 3000, 100, 10000];
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 export interface ArbOpportunity {
-  pair: any;
+  // ── pair object (dipakai executor.ts) ──
+  pair: {
+    name: string;
+    tokenIn: string;
+    tokenOut: string;
+    flashloanToken: string;
+    flashloanAmount: bigint;
+    uniswapFee: number;
+    aerodromeStable: boolean;   // ← dibutuhkan executor.ts
+  };
+
+  // ── fields langsung ──
   tokenIn: string;
   tokenOut: string;
   amountIn: bigint;
@@ -33,8 +44,12 @@ export interface ArbOpportunity {
   flashloanToken: string;
   flashloanAmount: bigint;
   timestamp: number;
+
+  // ── compat fields untuk executor.ts & index.ts ──
   strategyName: string;
-  expectedProfitEth: string;
+  strategy: string;             // ← dibutuhkan executor.ts (alias strategyName)
+  expectedProfitEth: string;    // string ETH
+  expectedProfit: bigint;       // ← dibutuhkan executor.ts (raw bigint)
   profitBps: number;
 }
 
@@ -53,14 +68,9 @@ export class PriceMonitor {
     this.aeroRouter = new ethers.Contract(ADDRESSES.AERODROME_ROUTER, AERODROME_ROUTER_ABI, provider);
   }
 
-  // ── Hitung amountOut dari sqrtPriceX96 (raw values, NO decimal adjustment) ─
-  // Formula Uniswap V3:
-  //   price = (sqrtP / 2^96)^2 = token1_raw / token0_raw
-  //
-  //   tokenIn=token0 → amountOut = amountIn * sqrtP / 2^96 * sqrtP / 2^96
-  //   tokenIn=token1 → amountOut = amountIn * 2^96 / sqrtP * 2^96 / sqrtP
-  //
-  // Step-by-step division menghindari integer overflow
+  // ── Hitung amountOut dari sqrtPriceX96 (raw values only, NO decimal adjustment) ──
+  // token0→token1: amountIn * sqrtP/Q96 * sqrtP/Q96
+  // token1→token0: amountIn * Q96/sqrtP * Q96/sqrtP
   private calcAmountOut(
     sqrtPriceX96: bigint,
     amountIn: bigint,
@@ -68,19 +78,13 @@ export class PriceMonitor {
     token0: string,
   ): bigint {
     if (sqrtPriceX96 === 0n || amountIn === 0n) return 0n;
-
-    const Q96 = 2n ** 96n;
+    const Q96      = 2n ** 96n;
     const isToken0 = tokenIn.toLowerCase() === token0.toLowerCase();
-
     try {
       if (isToken0) {
-        // token0 → token1: multiply by price (sqrtP^2 / Q96^2)
-        // amountOut = amountIn * sqrtP / Q96 * sqrtP / Q96
         const step1 = amountIn * sqrtPriceX96 / Q96;
         return step1 * sqrtPriceX96 / Q96;
       } else {
-        // token1 → token0: divide by price (Q96^2 / sqrtP^2)
-        // amountOut = amountIn * Q96 / sqrtP * Q96 / sqrtP
         const step1 = amountIn * Q96 / sqrtPriceX96;
         return step1 * Q96 / sqrtPriceX96;
       }
@@ -97,7 +101,6 @@ export class PriceMonitor {
     preferredFee: number
   ): Promise<{ amountOut: bigint; fee: number; poolAddress: string }> {
     const feesToTry = [preferredFee, ...UNI_FEE_TIERS.filter(f => f !== preferredFee)];
-
     let bestOut  = 0n;
     let bestFee  = preferredFee;
     let bestPool = ethers.ZeroAddress;
@@ -116,11 +119,9 @@ export class PriceMonitor {
         const sqrtPriceX96: bigint = slot0Data[0];
         if (sqrtPriceX96 === 0n) continue;
 
-        // Kurangi fee dari amountIn (dalam bps per million)
         const feeAmount      = amountIn * BigInt(fee) / 1_000_000n;
         const amountAfterFee = amountIn - feeAmount;
-
-        const amountOut = this.calcAmountOut(sqrtPriceX96, amountAfterFee, tokenIn, token0);
+        const amountOut      = this.calcAmountOut(sqrtPriceX96, amountAfterFee, tokenIn, token0);
 
         if (amountOut > bestOut) {
           bestOut  = amountOut;
@@ -131,28 +132,32 @@ export class PriceMonitor {
         continue;
       }
     }
-
     return { amountOut: bestOut, fee: bestFee, poolAddress: bestPool };
   }
 
-  // ── Quote Aerodrome ────────────────────────────────────────────────────────
+  // ── Quote Aerodrome — coba volatile & stable, return terbaik ──────────────
   private async quoteAerodrome(
     tokenIn: string,
     tokenOut: string,
     amountIn: bigint
-  ): Promise<bigint> {
-    let bestOut = 0n;
+  ): Promise<{ amountOut: bigint; stable: boolean }> {
+    let bestOut    = 0n;
+    let bestStable = false;
+
     for (const stable of [false, true]) {
       try {
         const routes = [{ from: tokenIn, to: tokenOut, stable, factory: ADDRESSES.AERODROME_FACTORY }];
         const amounts = await this.aeroRouter.getAmountsOut(amountIn, routes);
         const out: bigint = amounts[amounts.length - 1];
-        if (out > bestOut) bestOut = out;
+        if (out > bestOut) {
+          bestOut    = out;
+          bestStable = stable;
+        }
       } catch {
         continue;
       }
     }
-    return bestOut;
+    return { amountOut: bestOut, stable: bestStable };
   }
 
   // ── Estimasi profit dalam ETH ──────────────────────────────────────────────
@@ -170,12 +175,13 @@ export class PriceMonitor {
   async scanPair(pair: typeof ARB_PAIRS[0]): Promise<ArbOpportunity | null> {
     const amountIn = ethers.parseUnits(pair.flashloanAmount, pair.decimalsIn);
 
-    const [uniResult, aeroOut] = await Promise.all([
+    const [uniResult, aeroResult] = await Promise.all([
       this.quoteUniswap(pair.tokenIn, pair.tokenOut, amountIn, pair.uniswapFee),
       this.quoteAerodrome(pair.tokenIn, pair.tokenOut, amountIn),
     ]);
 
-    const uniOut = uniResult.amountOut;
+    const uniOut  = uniResult.amountOut;
+    const aeroOut = aeroResult.amountOut;
 
     if (uniOut === 0n || aeroOut === 0n) {
       logger.warn(
@@ -217,14 +223,18 @@ export class PriceMonitor {
 
     logger.info(`✅ OPPORTUNITY: ${pair.name} ${direction} profit~${netProfitEth.toFixed(6)} ETH`);
 
+    // expectedProfit dalam wei (estimasi kasar dalam WETH)
+    const expectedProfitWei = ethers.parseEther(netProfitEth.toFixed(8));
+
     return {
       pair: {
-        name: pair.name,
-        tokenIn: pair.tokenIn,
-        tokenOut: pair.tokenOut,
-        flashloanToken: pair.flashloanToken,
+        name:            pair.name,
+        tokenIn:         pair.tokenIn,
+        tokenOut:        pair.tokenOut,
+        flashloanToken:  pair.flashloanToken,
         flashloanAmount,
-        uniswapFee: uniResult.fee,
+        uniswapFee:      uniResult.fee,
+        aerodromeStable: aeroResult.stable,   // ← pool type terbaik dari quote
       },
       tokenIn:          pair.tokenIn,
       tokenOut:         pair.tokenOut,
@@ -238,7 +248,9 @@ export class PriceMonitor {
       flashloanAmount,
       timestamp:        Date.now(),
       strategyName:     direction,
+      strategy:         direction,              // ← alias untuk executor.ts
       expectedProfitEth: netProfitEth.toFixed(6),
+      expectedProfit:   expectedProfitWei,      // ← bigint untuk executor.ts
       profitBps:        Number(spreadBps),
     };
   }
